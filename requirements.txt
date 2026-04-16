@@ -1,0 +1,9 @@
+jupyterlab
+notebook
+ipykernel
+numpy
+scipy
+matplotlib
+tifffile
+scikit-image
+PyQt6
