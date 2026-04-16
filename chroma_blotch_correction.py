@@ -592,25 +592,29 @@ class BlotchEqualizerWindow(QMainWindow):
     def _build_step1(self):
         page = QWidget()
         lay = QVBoxLayout(page)
-
-        form = QFormLayout()
         self.input_edit = QLineEdit()
         self.input_browse_btn = QPushButton("Browse")
+        self.load_btn = QPushButton("Load")
 
         row = QWidget()
         r = QHBoxLayout(row)
         r.setContentsMargins(0, 0, 0, 0)
         r.addWidget(self.input_edit)
         r.addWidget(self.input_browse_btn)
+        self.input_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.input_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.load_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        form.addRow("Input 16-bit TIFF:", row)
-        lay.addLayout(form)
+        lay.addWidget(QLabel("Input 16-bit TIFF:"))
+        lay.addWidget(row)
+        lay.addWidget(self.load_btn)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, "1. Source File")
 
         self.input_browse_btn.clicked.connect(self.on_browse_input)
         self.input_edit.editingFinished.connect(self.on_input_changed)
+        self.load_btn.clicked.connect(self.on_load_clicked)
 
     def _build_step2(self):
         page = QWidget()
@@ -628,8 +632,8 @@ class BlotchEqualizerWindow(QMainWindow):
         br.setContentsMargins(0, 0, 0, 0)
         self.range_blur_slider = QSlider(Qt.Orientation.Horizontal)
         self.range_blur_slider.setRange(0, 64)
-        self.range_blur_slider.setValue(12)
-        self.range_blur_value = QLabel("12")
+        self.range_blur_slider.setValue(0)
+        self.range_blur_value = QLabel("0")
         br.addWidget(QLabel("Mask blur radius:"))
         br.addWidget(self.range_blur_slider)
         br.addWidget(self.range_blur_value)
@@ -723,8 +727,6 @@ class BlotchEqualizerWindow(QMainWindow):
     def _build_step5(self):
         page = QWidget()
         lay = QVBoxLayout(page)
-
-        form = QFormLayout()
         self.output_edit = QLineEdit()
         self.output_browse_btn = QPushButton("Browse")
 
@@ -733,11 +735,14 @@ class BlotchEqualizerWindow(QMainWindow):
         r.setContentsMargins(0, 0, 0, 0)
         r.addWidget(self.output_edit)
         r.addWidget(self.output_browse_btn)
+        self.output_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.output_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        form.addRow("Output TIFF:", row)
-        lay.addLayout(form)
+        lay.addWidget(QLabel("Output TIFF:"))
+        lay.addWidget(row)
 
         self.save_btn = QPushButton("Save")
+        self.save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         lay.addWidget(self.save_btn)
         lay.addStretch(1)
 
@@ -765,7 +770,12 @@ class BlotchEqualizerWindow(QMainWindow):
         out = Path(output_arg).expanduser().resolve() if output_arg else default_output_path(input_path)
         self.output_edit.setText(str(out))
 
-        self.load_input(input_path)
+        self.original_view.set_placeholder("Select input and press Load.")
+        self.mask_view.set_placeholder("Load source first.")
+        self.rg_view.set_placeholder("Load source first.")
+        self.by_view.set_placeholder("Load source first.")
+        self.corrected_view.set_placeholder("Load source first.")
+        self.status("Source preselected. Press Load to start.")
         self.toolbox.setCurrentIndex(0)
         self.on_step_changed(0)
 
@@ -853,6 +863,18 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.input_edit.setText(str(path))
         self.output_edit.setText(str(default_output_path(path)))
+        self.status("Input path updated. Press Load.")
+
+    def on_load_clicked(self):
+        raw = self.input_edit.text().strip()
+        if not raw:
+            self.show_error("Select input file first.")
+            return
+        path = Path(raw).expanduser().resolve()
+        if not path.exists():
+            self.show_error(f"Input file not found: {path}")
+            return
+
         self.load_input(path)
 
     def on_browse_output(self):
@@ -1051,26 +1073,6 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_worker = None
         self.fields_thread = None
 
-    def compute_corrected_rgb(self) -> np.ndarray:
-        if self.pipeline is None:
-            raise RuntimeError("No image loaded")
-        if not self.fields_ready:
-            raise RuntimeError("Fields are not ready. Run Preview in step 3 first.")
-
-        p = self.pipeline
-        rg_k = float(self.rg_strength_slider.value()) / 100.0
-        by_k = float(self.by_strength_slider.value()) / 100.0
-
-        a_corr = p.a - rg_k * p.RG_field * p.apply_alpha
-        b_corr = p.b - by_k * p.BY_field * p.apply_alpha
-
-        lab_corr = p.lab.copy()
-        lab_corr[..., 1] = a_corr
-        lab_corr[..., 2] = b_corr
-
-        rgb_corr = clamp01(color.lab2rgb(lab_corr).astype(np.float32))
-        return rgb_corr
-
     def on_correction_preview(self):
         if self.pipeline is None:
             self.show_error("Load source file first.")
@@ -1205,11 +1207,13 @@ class BlotchEqualizerWindow(QMainWindow):
             self.mask_view.set_placeholder("Mask preview")
             return
 
-        mask_rgb = np.where(
-            self.pipeline.working_mask[..., None],
-            np.array([0.95, 0.95, 0.95], dtype=np.float32),
-            np.array([0.08, 0.08, 0.08], dtype=np.float32),
-        )
+        soft = self.pipeline.range_soft
+        mask = self.pipeline.working_mask
+        mask_rgb = np.zeros((soft.shape[0], soft.shape[1], 3), dtype=np.float32)
+        mask_rgb[..., 1] = soft
+        mask_rgb[..., 0] = soft * 0.35
+        mask_rgb[..., 2] = 1.0 - soft
+        mask_rgb = np.where(mask[..., None], mask_rgb, np.array([0.07, 0.07, 0.07], dtype=np.float32))
         self.mask_view.set_image(mask_rgb)
 
     def update_fields_view(self):
