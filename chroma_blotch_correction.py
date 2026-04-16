@@ -571,6 +571,7 @@ class CorrectionWorker(QObject):
 
     def __init__(
         self,
+        revision: int,
         lab: np.ndarray,
         a: np.ndarray,
         b: np.ndarray,
@@ -581,6 +582,7 @@ class CorrectionWorker(QObject):
         by_k: float,
     ):
         super().__init__()
+        self.revision = revision
         self.lab = lab
         self.a = a
         self.b = b
@@ -613,6 +615,7 @@ class CorrectionWorker(QObject):
 
             self.finished.emit(
                 {
+                    "revision": self.revision,
                     "rgb_corr": rgb_corr,
                     "elapsed": time.perf_counter() - t0,
                     "delta_rg_sigma": delta_a,
@@ -646,12 +649,14 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_ready = False
         self.mask_running = False
         self.mask_revision = 0
+        self.mask_apply_pending = False
 
         self.fields_ready = False
         self.fields_preview_available = False
         self.fields_running = False
         self.fields_revision = 0
 
+        self.correction_revision = 0
         self.correction_ready = False
         self.correction_preview_available = False
         self.correction_running = False
@@ -829,7 +834,7 @@ class BlotchEqualizerWindow(QMainWindow):
         br = QHBoxLayout(blur_row)
         br.setContentsMargins(0, 0, 0, 0)
         self.range_blur_slider = QSlider(Qt.Orientation.Horizontal)
-        self.range_blur_slider.setRange(0, 64)
+        self.range_blur_slider.setRange(0, 15)
         self.range_blur_slider.setValue(0)
         self.range_blur_value = QLabel("0")
         br.addWidget(QLabel("Mask blur radius:"))
@@ -953,6 +958,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.toolbox.addItem(page, self.step_titles[4])
 
         self.output_browse_btn.clicked.connect(self.on_browse_output)
+        self.output_edit.editingFinished.connect(self.on_output_changed)
         self.save_btn.clicked.connect(self.on_save)
 
     def status(self, text: str):
@@ -1008,6 +1014,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def invalidate_fields(self):
         self.fields_revision += 1
         self.fields_ready = False
+        self.correction_revision += 1
         self.correction_ready = False
 
     def load_input(self, path: Path):
@@ -1118,6 +1125,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit.setText(str(path))
         self.output_edit.setText(str(default_output_path(path)))
         self._set_step_dirty(0, True)
+        self._mark_steps_dirty_from(1)
         LOG.info("Input path set: %s", path)
         LOG.info("Output path auto-set: %s", self.output_edit.text().strip())
         self.status("Input path updated. Press Load.")
@@ -1145,14 +1153,42 @@ class BlotchEqualizerWindow(QMainWindow):
         )
         if path:
             self.output_edit.setText(path)
+            self._set_step_dirty(4, True)
             LOG.info("Output selected via dialog: %s", path)
+            self.status("Output path updated. Press Save to write result.")
+
+    def on_output_changed(self):
+        if self.pipeline is None:
+            return
+        self._set_step_dirty(4, True)
+        LOG.info("Output path edited: %s", self.output_edit.text().strip())
+        self.status("Output path updated. Press Save to write result.")
 
     def on_reset_curve(self):
         self.curve.reset_curve()
 
     def on_apply_mask_clicked(self):
-        LOG.info("Apply mask clicked (UI-only action).")
-        self.status("Mask settings are already applied automatically.")
+        if self.pipeline is None:
+            self.show_error("Load source file first.")
+            return
+
+        if self.mask_running:
+            self.mask_apply_pending = True
+            LOG.info("Apply mask clicked while mask is running; waiting for recalculation to finish.")
+            self.status("Apply mask queued. Waiting for recalculation to finish...")
+            return
+
+        if not self.mask_ready:
+            self.mask_apply_pending = True
+            LOG.info("Apply mask clicked while mask is not ready; starting recalculation.")
+            self.status("Applying mask: recalculating...")
+            self.request_mask_recompute()
+            return
+
+        self.mask_apply_pending = False
+        self._set_step_dirty(1, False)
+        LOG.info("Apply mask completed.")
+        self.status("Mask applied.")
 
     def on_range_blur_changed(self, value: int):
         self.range_blur_value.setText(str(value))
@@ -1161,6 +1197,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_mask_controls_changed(self, *_):
         if self.pipeline is None:
             return
+        self.mask_apply_pending = False
         self._mark_steps_dirty_from(1)
         LOG.debug(
             "Mask controls changed: invert=%s, blur=%s",
@@ -1179,6 +1216,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_strength_changed(self):
         self.rg_strength_value.setText(str(self.rg_strength_slider.value()))
         self.by_strength_value.setText(str(self.by_strength_slider.value()))
+        self.correction_revision += 1
         self.correction_ready = False
         self._mark_steps_dirty_from(3)
         LOG.info(
@@ -1250,7 +1288,6 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.range_soft = result["range_soft"]
         self.pipeline.working_mask = result["working_mask"]
         self.mask_ready = True
-        self._set_step_dirty(1, False)
         self.invalidate_fields()
 
         if self.toolbox.currentIndex() == 1:
@@ -1267,6 +1304,12 @@ class BlotchEqualizerWindow(QMainWindow):
         )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
 
+        if self.mask_apply_pending:
+            self.mask_apply_pending = False
+            self._set_step_dirty(1, False)
+            LOG.info("Apply mask completed after recalculation.")
+            self.status("Mask applied.")
+
         if self.mask_revision > result["revision"]:
             self.request_mask_recompute()
 
@@ -1274,6 +1317,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_mask_failed(self, message: str):
         self.mask_running = False
         self.mask_ready = False
+        self.mask_apply_pending = False
         self.show_error(f"Mask recomputation failed: {message}")
 
     def cleanup_mask_worker(self, *_):
@@ -1366,6 +1410,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.apply_alpha = result["apply_alpha"]
         self.fields_ready = True
         self.fields_preview_available = True
+        self.correction_revision += 1
         self.correction_ready = False
         self._set_step_dirty(2, False)
 
@@ -1443,9 +1488,11 @@ class BlotchEqualizerWindow(QMainWindow):
 
         rg_k = float(self.rg_strength_slider.value()) / 100.0
         by_k = float(self.by_strength_slider.value()) / 100.0
+        rev = self.correction_revision
         p = self.pipeline
         LOG.info(
-            "Correction preview start | RG=%.2f BY=%.2f | fields_ready=%s",
+            "Correction preview start | revision=%d | RG=%.2f BY=%.2f | fields_ready=%s",
+            rev,
             rg_k,
             by_k,
             self.fields_ready,
@@ -1455,6 +1502,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.corr_thread.setObjectName("correction_worker")
         self._register_thread(self.corr_thread)
         self.corr_worker = CorrectionWorker(
+            revision=rev,
             lab=p.lab.copy(),
             a=p.a.copy(),
             b=p.b.copy(),
@@ -1482,11 +1530,20 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_correction_finished(self, result):
         self.correction_running = False
         self.correction_preview_btn.setEnabled(True)
+
+        if result["revision"] != self.correction_revision:
+            LOG.info(
+                "Outdated correction result ignored: result_rev=%d current_rev=%d",
+                result["revision"],
+                self.correction_revision,
+            )
+            self.status("Outdated correction result ignored.")
+            return
+
         self.current_corrected_rgb = result["rgb_corr"]
         self.correction_preview_available = True
         self.correction_ready = True
         self._set_step_dirty(3, False)
-        self._set_step_dirty(4, False)
         if self.toolbox.currentIndex() in (3, 4):
             self.update_corrected_view()
         LOG.info(
@@ -1553,6 +1610,7 @@ class BlotchEqualizerWindow(QMainWindow):
             saved = self.save_tiff(rgb_corr, out_path)
             LOG.info("Saved output TIFF: %s", saved)
             LOG.info("Saved shape=%s dtype=%s", rgb_corr.shape, np.uint16)
+            self._set_step_dirty(4, False)
             self.status(f"Saved: {saved}")
             QMessageBox.information(self, "Saved", f"Saved: {saved}")
         except Exception as exc:
