@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -2526,7 +2527,37 @@ def main(argv: list[str]) -> int:
     app = QApplication(sys.argv)
     win = BlotchEqualizerWindow(args)
     win.show()
+
+    sigint_requested = {"value": False}
+
+    def _on_sigint(signum, frame):
+        sigint_requested["value"] = True
+        LOG.info("SIGINT received (signum=%s). Requesting graceful shutdown...", signum)
+
+    def _on_sigterm(signum, frame):
+        sigint_requested["value"] = True
+        LOG.info("SIGTERM received (signum=%s). Requesting graceful shutdown...", signum)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        # Some environments may not expose/allow SIGTERM handlers.
+        pass
+
+    sig_timer = QTimer()
+    sig_timer.setInterval(100)
+
+    def _poll_signals():
+        if sigint_requested["value"]:
+            sigint_requested["value"] = False
+            app.quit()
+
+    sig_timer.timeout.connect(_poll_signals)
+    sig_timer.start()
+
     exit_code = app.exec()
+    sig_timer.stop()
     qInstallMessageHandler(None)
     LOG.info("Application exit with code %d", exit_code)
     return exit_code
