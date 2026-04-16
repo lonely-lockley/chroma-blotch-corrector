@@ -793,7 +793,7 @@ class CorrectionWorker(QObject):
 class BlotchEqualizerWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
-        self.setWindowTitle("Blotch Equalizer")
+        self.setWindowTitle("Chroma Blotch Corrector")
         self.resize(1500, 920)
         self.step_titles = [
             "1. Source File",
@@ -813,11 +813,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_running = False
         self.mask_revision = 0
         self.mask_apply_pending = False
+        self.mask_apply_auto = False
         self.mask_queue_notified = False
         self.auto_open_step2_after_mask = False
         self.mask_prepared_L_work: Optional[np.ndarray] = None
         self.mask_prepared_scale: float = 1.0
         self.mask_prepared_src_shape: Optional[tuple[int, int]] = None
+        self.auto_target_step = 0
 
         self.fields_ready = False
         self.fields_preview_available = False
@@ -886,6 +888,107 @@ class BlotchEqualizerWindow(QMainWindow):
             return
         self.toolbox.setCurrentIndex(next_idx)
         LOG.info("Auto-opened next step: %d -> %d", current_step_idx + 1, next_idx + 1)
+
+    def _clear_auto_target(self):
+        if self.auto_target_step != 0:
+            LOG.info("Auto-run target cleared (was step %d)", self.auto_target_step)
+        self.auto_target_step = 0
+
+    def _complete_mask_apply(self, auto: bool):
+        self.mask_apply_pending = False
+        self.mask_apply_auto = False
+        self._set_step_dirty(1, False)
+        if auto:
+            LOG.info("Mask apply completed automatically.")
+            self.status("Mask applied (auto).")
+            return
+        LOG.info("Apply mask completed.")
+        self.status("Mask applied.")
+        self._open_next_step(1)
+
+    def _request_auto_run(self, target_step: int, reason: str):
+        target_step = int(np.clip(target_step, 1, 5))
+        prev = self.auto_target_step
+        self.auto_target_step = max(self.auto_target_step, target_step)
+        LOG.info(
+            "Auto-run requested: reason=%s | target_step=%d | previous_target=%d",
+            reason,
+            self.auto_target_step,
+            prev,
+        )
+        self._drive_auto_pipeline()
+
+    def _drive_auto_pipeline(self):
+        if self.auto_target_step == 0:
+            return
+
+        if self.load_running or self.mask_running or self.fields_running or self.correction_running:
+            return
+
+        target = self.auto_target_step
+
+        if self.pipeline is None or self.step_dirty[0]:
+            raw = self.input_edit.text().strip()
+            if not raw:
+                self._clear_auto_target()
+                self.show_error("Select input file first.")
+                return
+            path = Path(raw).expanduser().resolve()
+            if not path.exists():
+                self._clear_auto_target()
+                self.show_error(f"Input file not found: {path}")
+                return
+            self.status("Auto-run: loading source image...")
+            self.load_input(path)
+            return
+
+        if target >= 2:
+            if self.step_dirty[1]:
+                if self.mask_ready:
+                    self._complete_mask_apply(auto=True)
+                    self._drive_auto_pipeline()
+                    return
+                self.mask_apply_pending = True
+                self.mask_apply_auto = True
+                self.status("Auto-run: applying mask...")
+                self.request_mask_recompute()
+                return
+            if not self.mask_ready:
+                self.mask_apply_pending = True
+                self.mask_apply_auto = True
+                self.status("Auto-run: recalculating mask...")
+                self.request_mask_recompute()
+                return
+
+        if target >= 3 and (self.step_dirty[2] or not self.fields_ready):
+            self.status("Auto-run: calculating RG/BY fields...")
+            try:
+                self._start_fields_preview()
+            except Exception as exc:
+                self._clear_auto_target()
+                self.show_error(f"Field calculation failed: {exc}")
+            return
+
+        if target >= 4 and (self.step_dirty[3] or not self.correction_ready or self.current_corrected_rgb is None):
+            self.status("Auto-run: building correction preview...")
+            try:
+                self._start_correction_preview()
+            except Exception as exc:
+                self._clear_auto_target()
+                self.show_error(f"Correction preview failed: {exc}")
+            return
+
+        if target >= 5:
+            self.status("Auto-run: saving result...")
+            try:
+                self._perform_save()
+            except Exception as exc:
+                LOG.exception("Auto-run save failed")
+                self.show_error(f"Save failed: {exc}")
+            self._clear_auto_target()
+            return
+
+        self._clear_auto_target()
 
     def _build_ui(self):
         central = QWidget()
@@ -1304,7 +1407,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_original_view()
         self.update_fields_view()
         self.update_corrected_view()
-        self.auto_open_step2_after_mask = True
+        self.auto_open_step2_after_mask = self.auto_target_step == 0
         self.status("Image displayed. Recomputing mask in background...")
         QTimer.singleShot(0, self.request_mask_recompute)
 
@@ -1339,6 +1442,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.load_running = False
         self.auto_open_step2_after_mask = False
         self._set_load_controls_enabled(True)
+        self._clear_auto_target()
         LOG.error("Load failed: %s", message)
         self.show_error(f"Load failed: {message}")
 
@@ -1428,27 +1532,25 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def on_apply_mask_clicked(self):
         if self.pipeline is None:
-            self.show_error("Load source file first.")
+            self._request_auto_run(2, "apply_mask_clicked_without_loaded_pipeline")
             return
 
         if self.mask_running:
             self.mask_apply_pending = True
+            self.mask_apply_auto = False
             LOG.info("Apply mask clicked while mask is running; waiting for recalculation to finish.")
             self.status("Apply mask queued. Waiting for recalculation to finish...")
             return
 
         if not self.mask_ready:
             self.mask_apply_pending = True
+            self.mask_apply_auto = False
             LOG.info("Apply mask clicked while mask is not ready; starting recalculation.")
             self.status("Applying mask: recalculating...")
             self.request_mask_recompute()
             return
 
-        self.mask_apply_pending = False
-        self._set_step_dirty(1, False)
-        LOG.info("Apply mask completed.")
-        self.status("Mask applied.")
-        self._open_next_step(1)
+        self._complete_mask_apply(auto=False)
 
     def on_range_blur_changed(self, value: int):
         self.range_blur_value.setText(str(value))
@@ -1598,22 +1700,23 @@ class BlotchEqualizerWindow(QMainWindow):
             self._open_next_step(0)
 
         if self.mask_apply_pending:
-            self.mask_apply_pending = False
-            self._set_step_dirty(1, False)
-            LOG.info("Apply mask completed after recalculation.")
-            self.status("Mask applied.")
-            self._open_next_step(1)
+            self._complete_mask_apply(auto=self.mask_apply_auto)
 
         if self.mask_revision > result["revision"]:
             self.request_mask_recompute()
+            return
+
+        self._drive_auto_pipeline()
 
     @pyqtSlot(str)
     def on_mask_failed(self, message: str):
         self.mask_running = False
         self.mask_ready = False
         self.mask_apply_pending = False
+        self.mask_apply_auto = False
         self.auto_open_step2_after_mask = False
         self.mask_queue_notified = False
+        self._clear_auto_target()
         self.show_error(f"Mask recomputation failed: {message}")
 
     def cleanup_mask_worker(self, *_):
@@ -1631,24 +1734,12 @@ class BlotchEqualizerWindow(QMainWindow):
         if isinstance(worker, QObject):
             worker.deleteLater()
 
-    def on_fields_preview(self):
-        if self.pipeline is None:
-            self.show_error("Load source file first.")
-            return
-        if self.mask_running:
-            self.show_error("Mask is being recalculated. Wait and run Preview again.")
-            return
-        if not self.mask_ready:
-            self.show_error("Mask is not ready yet. Wait for mask recalculation to finish.")
-            return
-        if self.fields_running:
-            self.status("Field calculation already running...")
-            return
-
+    def _start_fields_preview(self):
         p = self.pipeline
+        if p is None:
+            raise RuntimeError("Pipeline is not loaded.")
         if not np.any(p.working_mask):
-            self.show_error("Working mask is empty. Adjust mask controls first.")
-            return
+            raise RuntimeError("Working mask is empty. Adjust mask controls first.")
 
         rev = self.fields_revision
         sigma_lo = self.sigma_options[int(self.sigma_slider.value())]
@@ -1687,6 +1778,9 @@ class BlotchEqualizerWindow(QMainWindow):
         self.status("Calculating RG/BY fields...")
         self.fields_thread.start()
 
+    def on_fields_preview(self):
+        self._request_auto_run(3, "step3_calculate_clicked")
+
     @pyqtSlot(int, str)
     def on_fields_progress(self, percent: int, message: str):
         self.status(f"Calculating RG/BY fields... {percent}% | {message}")
@@ -1697,9 +1791,11 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_preview_btn.setEnabled(True)
 
         if self.pipeline is None:
+            self._clear_auto_target()
             return
         if result["revision"] != self.fields_revision:
             self.status("Outdated field result ignored.")
+            self._drive_auto_pipeline()
             return
 
         self.pipeline.RG_field = result["RG_field"]
@@ -1744,12 +1840,14 @@ class BlotchEqualizerWindow(QMainWindow):
             f"coverage(alpha>0.5)={result['coverage']:.2f}%"
         )
         self.update_fields_view()
+        self._drive_auto_pipeline()
 
     @pyqtSlot(str)
     def on_fields_failed(self, message: str):
         self.fields_running = False
         self.fields_preview_btn.setEnabled(True)
         self.fields_next_btn.setVisible(False)
+        self._clear_auto_target()
         LOG.error("Field calculation failed: %s", message)
         self.show_error(f"Field calculation failed: {message}")
 
@@ -1768,27 +1866,13 @@ class BlotchEqualizerWindow(QMainWindow):
         if isinstance(worker, QObject):
             worker.deleteLater()
 
-    def on_correction_preview(self):
-        if self.pipeline is None:
-            self.show_error("Load source file first.")
-            return
-        if self.mask_running:
-            self.show_error("Mask is recalculating. Wait for completion.")
-            return
-        if self.fields_running:
-            self.show_error("RG/BY field calculation is running. Wait for completion.")
-            return
-        if not self.fields_ready:
-            self.show_error("Run Preview in step 3 first.")
-            return
-        if self.correction_running:
-            self.status("Correction preview already running...")
-            return
-
+    def _start_correction_preview(self):
+        p = self.pipeline
+        if p is None:
+            raise RuntimeError("Pipeline is not loaded.")
         rg_k = float(self.rg_strength_slider.value()) / 100.0
         by_k = float(self.by_strength_slider.value()) / 100.0
         rev = self.correction_revision
-        p = self.pipeline
         LOG.info(
             "Correction preview start | revision=%d | RG=%.2f BY=%.2f | fields_ready=%s",
             rev,
@@ -1826,6 +1910,9 @@ class BlotchEqualizerWindow(QMainWindow):
         self.status("Building corrected preview...")
         self.corr_thread.start()
 
+    def on_correction_preview(self):
+        self._request_auto_run(4, "step4_preview_clicked")
+
     @pyqtSlot(object)
     def on_correction_finished(self, result):
         self.correction_running = False
@@ -1838,6 +1925,7 @@ class BlotchEqualizerWindow(QMainWindow):
                 self.correction_revision,
             )
             self.status("Outdated correction result ignored.")
+            self._drive_auto_pipeline()
             return
 
         self.current_corrected_rgb = result["rgb_corr"]
@@ -1856,12 +1944,14 @@ class BlotchEqualizerWindow(QMainWindow):
             result["by_k"],
         )
         self.status(f"Correction preview ready in {result['elapsed']:.2f}s")
+        self._drive_auto_pipeline()
 
     @pyqtSlot(str)
     def on_correction_failed(self, message: str):
         self.correction_running = False
         self.correction_preview_btn.setEnabled(True)
         self.correction_next_btn.setVisible(False)
+        self._clear_auto_target()
         LOG.error("Correction preview failed: %s", message)
         self.show_error(f"Correction preview failed: {message}")
 
@@ -1880,6 +1970,30 @@ class BlotchEqualizerWindow(QMainWindow):
         if isinstance(worker, QObject):
             worker.deleteLater()
 
+    def _perform_save(self):
+        if self.pipeline is None:
+            raise RuntimeError("Load source file first.")
+        if self.current_corrected_rgb is None:
+            raise RuntimeError("Corrected preview is empty.")
+        rgb_corr = self.current_corrected_rgb
+        out_path = Path(self.output_edit.text().strip())
+        if not out_path.suffix:
+            out_path = out_path.with_suffix(".tiff")
+            self.output_edit.setText(str(out_path))
+        if out_path.suffix.lower() not in {".tif", ".tiff"}:
+            out_path = out_path.with_suffix(".tiff")
+            self.output_edit.setText(str(out_path))
+
+        saved = self.save_tiff(rgb_corr, out_path)
+        LOG.info("Saved output TIFF: %s", saved)
+        LOG.info("Saved shape=%s dtype=%s", rgb_corr.shape, np.uint16)
+        self._set_step_dirty(4, False)
+        self.status(f"Saved: {saved}")
+        QMessageBox.information(self, "Saved", f"Saved: {saved}")
+
+    def on_save(self):
+        self._request_auto_run(5, "step5_save_clicked")
+
     def save_tiff(self, rgb_corr: np.ndarray, output_path: Path) -> Path:
         output_path = output_path.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1887,37 +2001,6 @@ class BlotchEqualizerWindow(QMainWindow):
         out = np.round(rgb_corr * np.iinfo(np.uint16).max).astype(np.uint16)
         imwrite(output_path, out)
         return output_path
-
-    def on_save(self):
-        if self.pipeline is None:
-            self.show_error("Load source file first.")
-            return
-        if not self.fields_ready:
-            self.show_error("Run Preview in step 3 before saving.")
-            return
-        if not self.correction_ready or self.current_corrected_rgb is None:
-            self.show_error("Run Preview in step 4 before saving.")
-            return
-
-        try:
-            rgb_corr = self.current_corrected_rgb
-            out_path = Path(self.output_edit.text().strip())
-            if not out_path.suffix:
-                out_path = out_path.with_suffix(".tiff")
-                self.output_edit.setText(str(out_path))
-            if out_path.suffix.lower() not in {".tif", ".tiff"}:
-                out_path = out_path.with_suffix(".tiff")
-                self.output_edit.setText(str(out_path))
-
-            saved = self.save_tiff(rgb_corr, out_path)
-            LOG.info("Saved output TIFF: %s", saved)
-            LOG.info("Saved shape=%s dtype=%s", rgb_corr.shape, np.uint16)
-            self._set_step_dirty(4, False)
-            self.status(f"Saved: {saved}")
-            QMessageBox.information(self, "Saved", f"Saved: {saved}")
-        except Exception as exc:
-            LOG.exception("Save failed")
-            self.show_error(f"Save failed: {exc}")
 
     def on_step_changed(self, idx: int):
         LOG.debug("Step changed: %d", idx + 1)
@@ -1980,7 +2063,7 @@ class BlotchEqualizerWindow(QMainWindow):
             return
 
         if not self.correction_preview_available or self.current_corrected_rgb is None:
-            self.corrected_view.set_placeholder("Press Preview in step 4.")
+            self.corrected_view.set_placeholder("Preview not available")
             return
         self.corrected_view.set_image(self.current_corrected_rgb)
 
