@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import sys
@@ -19,7 +20,7 @@ from scipy import ndimage as ndi
 from skimage import color, filters, morphology
 from tifffile import TiffFile, imread, imwrite
 
-from PyQt6.QtCore import QObject, QThread, Qt, QtMsgType, pyqtSignal, pyqtSlot, qInstallMessageHandler
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QtMsgType, pyqtSignal, pyqtSlot, qInstallMessageHandler
 from PyQt6.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -44,6 +45,13 @@ from PyQt6.QtWidgets import (
 
 def clamp01(x: np.ndarray) -> np.ndarray:
     return np.clip(x, 0.0, 1.0)
+
+
+def choose_blur_workers(max_workers: int = 4) -> int:
+    cores = os.cpu_count()
+    if cores is None:
+        return 1
+    return int(max(1, min(max_workers, cores)))
 
 
 APP_LOGGER_NAME = "chroma_blotch"
@@ -215,6 +223,11 @@ def build_base_background_mask(L: np.ndarray):
     return background_mask.astype(bool), L_norm.astype(np.float32), stats
 
 
+def quick_l_norm(L: np.ndarray) -> np.ndarray:
+    L_low, L_high = np.percentile(L, [1, 99])
+    return clamp01((L - L_low) / (L_high - L_low + 1e-8)).astype(np.float32)
+
+
 def rgb_to_qpixmap(rgb: np.ndarray, width: int, height: int) -> QPixmap:
     rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
     h, w, _ = rgb8.shape
@@ -271,6 +284,7 @@ class CurveWidget(QWidget):
         self._xs = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
         self._ys = self._xs.copy()
         self._active_idx = -1
+        self._drag_changed = False
 
     def reset_curve(self):
         self._ys = self._xs.copy()
@@ -326,6 +340,7 @@ class CurveWidget(QWidget):
     def mousePressEvent(self, event):
         ex = event.position().x() if hasattr(event, "position") else event.x()
         ey = event.position().y() if hasattr(event, "position") else event.y()
+        self._drag_changed = False
 
         pts = [self._to_widget(float(x), float(y)) for x, y in zip(self._xs, self._ys)]
         d2 = [((ex - wx) ** 2 + (ey - wy) ** 2, i) for i, (wx, wy) in enumerate(pts)]
@@ -339,12 +354,16 @@ class CurveWidget(QWidget):
         ex = event.position().x() if hasattr(event, "position") else event.x()
         ey = event.position().y() if hasattr(event, "position") else event.y()
         _, y = self._from_widget(int(ex), int(ey))
-        self._ys[self._active_idx] = y
-        self.curveChanged.emit()
+        if float(self._ys[self._active_idx]) != float(y):
+            self._ys[self._active_idx] = y
+            self._drag_changed = True
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._active_idx >= 0 and self._drag_changed:
+            self.curveChanged.emit()
         self._active_idx = -1
+        self._drag_changed = False
 
 
 class FitImageLabel(QLabel):
@@ -376,6 +395,70 @@ class FitImageLabel(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh()
+
+
+class LoadWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(int, str)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    @pyqtSlot()
+    def run(self):
+        t0 = time.perf_counter()
+
+        def emit_progress(percent: int, text: str):
+            self.progress.emit(int(np.clip(percent, 0, 100)), text)
+
+        try:
+            emit_progress(5, "Reading TIFF from disk")
+            rgb_raw = imread(self.path)
+            if rgb_raw.dtype != np.uint16:
+                raise RuntimeError(f"Only 16-bit TIFF is supported right now. Got dtype={rgb_raw.dtype}")
+
+            emit_progress(38, "Normalizing RGB")
+            rgb_float = normalize_rgb(rgb_raw)
+
+            emit_progress(58, "Converting RGB -> Lab")
+            lab = color.rgb2lab(rgb_float).astype(np.float32)
+            L = lab[..., 0]
+            a = lab[..., 1]
+            b = lab[..., 2]
+
+            emit_progress(82, "Preparing luminance normalization")
+            L_norm = quick_l_norm(L)
+            l_med = float(np.median(L_norm))
+            l_mad = float(np.median(np.abs(L_norm - l_med)) + 1e-6)
+            base_stats = {
+                "median_L_norm": l_med,
+                "mad_L_norm": l_mad,
+                "bright_thresh": float(min(1.0, l_med + 3.5 * l_mad)),
+                "dark_thresh": float(max(0.0, l_med - 4.0 * l_mad)),
+                "contrast_thresh": 0.0,
+                "edge_thresh": 0.0,
+                "background_ratio_pct": 100.0,
+            }
+
+            emit_progress(98, "Finalizing load")
+            self.finished.emit(
+                {
+                    "path": self.path,
+                    "rgb_raw": rgb_raw,
+                    "rgb_float": rgb_float,
+                    "lab": lab,
+                    "L": L,
+                    "a": a,
+                    "b": b,
+                    "L_norm": L_norm,
+                    "base_stats": base_stats,
+                    "elapsed": time.perf_counter() - t0,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class MaskWorker(QObject):
@@ -483,14 +566,33 @@ class FieldsWorker(QObject):
             sigma_hi = self.sigma_lo * 2
             emit_progress(5, f"Preparing scales sigma={self.sigma_lo}/{sigma_hi}")
 
-            emit_progress(14, f"Blur A @ sigma={self.sigma_lo}")
-            a_lo, den_lo = masked_normalized_blur(self.a, self.working_mask, self.sigma_lo)
-            emit_progress(28, f"Blur B @ sigma={self.sigma_lo}")
-            b_lo, _ = masked_normalized_blur(self.b, self.working_mask, self.sigma_lo)
-            emit_progress(42, f"Blur A @ sigma={sigma_hi}")
-            a_hi, den_hi = masked_normalized_blur(self.a, self.working_mask, sigma_hi)
-            emit_progress(56, f"Blur B @ sigma={sigma_hi}")
-            b_hi, _ = masked_normalized_blur(self.b, self.working_mask, sigma_hi)
+            workers = choose_blur_workers(4)
+            emit_progress(8, f"Starting parallel blur jobs ({workers} workers)")
+            blur_jobs = [
+                ("a_lo", self.a, self.sigma_lo, f"Blur A @ sigma={self.sigma_lo}"),
+                ("b_lo", self.b, self.sigma_lo, f"Blur B @ sigma={self.sigma_lo}"),
+                ("a_hi", self.a, sigma_hi, f"Blur A @ sigma={sigma_hi}"),
+                ("b_hi", self.b, sigma_hi, f"Blur B @ sigma={sigma_hi}"),
+            ]
+            progress_marks = [20, 35, 50, 62]
+            blur_results = {}
+
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="field_blur") as pool:
+                futures = {
+                    pool.submit(masked_normalized_blur, channel, self.working_mask, sigma): (key, label)
+                    for key, channel, sigma, label in blur_jobs
+                }
+                done_count = 0
+                for future in as_completed(futures):
+                    key, label = futures[future]
+                    blur_results[key] = future.result()
+                    done_count += 1
+                    emit_progress(progress_marks[min(done_count - 1, len(progress_marks) - 1)], f"{label} done ({done_count}/4)")
+
+            a_lo, den_lo = blur_results["a_lo"]
+            b_lo, _ = blur_results["b_lo"]
+            a_hi, den_hi = blur_results["a_hi"]
+            b_hi, _ = blur_results["b_hi"]
 
             emit_progress(68, "Centering RG/BY components")
             rg_sign = 1.0
@@ -640,6 +742,7 @@ class BlotchEqualizerWindow(QMainWindow):
             "4. Correction",
             "5. Save",
         ]
+        self.sigma_options = [4, 8, 16, 32, 64]
         self.step_dirty = [False] * len(self.step_titles)
 
         self.pipeline: Optional[PipelineData] = None
@@ -650,6 +753,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_running = False
         self.mask_revision = 0
         self.mask_apply_pending = False
+        self.mask_queue_notified = False
+        self.auto_open_step2_after_mask = False
 
         self.fields_ready = False
         self.fields_preview_available = False
@@ -660,6 +765,10 @@ class BlotchEqualizerWindow(QMainWindow):
         self.correction_ready = False
         self.correction_preview_available = False
         self.correction_running = False
+
+        self.load_running = False
+        self.load_thread: Optional[QThread] = None
+        self.load_worker: Optional[LoadWorker] = None
 
         self.mask_thread: Optional[QThread] = None
         self.mask_worker: Optional[MaskWorker] = None
@@ -675,6 +784,10 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def _style_primary_action_button(self, button: QPushButton):
         button.setProperty("primaryAction", True)
+        button.setMinimumHeight(44)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def _style_large_action_button(self, button: QPushButton):
         button.setMinimumHeight(44)
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -697,6 +810,10 @@ class BlotchEqualizerWindow(QMainWindow):
             if not self.step_dirty[i]:
                 self.step_dirty[i] = True
                 changed = True
+            if i == 2 and hasattr(self, "fields_next_btn"):
+                self.fields_next_btn.setVisible(False)
+            if i == 3 and hasattr(self, "correction_next_btn"):
+                self.correction_next_btn.setVisible(False)
         if changed:
             self._refresh_step_titles()
 
@@ -866,6 +983,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.curve.curveChanged.connect(self.on_mask_controls_changed)
         self.invert_check.stateChanged.connect(self.on_mask_controls_changed)
         self.range_blur_slider.valueChanged.connect(self.on_range_blur_changed)
+        self.range_blur_slider.sliderReleased.connect(self.on_mask_controls_changed)
 
     def _build_step3(self):
         page = QWidget()
@@ -881,25 +999,32 @@ class BlotchEqualizerWindow(QMainWindow):
         sr = QHBoxLayout(sigma_row)
         sr.setContentsMargins(0, 0, 0, 0)
         self.sigma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.sigma_slider.setRange(8, 64)
-        self.sigma_slider.setValue(32)
+        self.sigma_slider.setRange(0, len(self.sigma_options) - 1)
+        self.sigma_slider.setSingleStep(1)
+        self.sigma_slider.setPageStep(1)
+        self.sigma_slider.setValue(self.sigma_options.index(32))
         self.sigma_value = QLabel("32")
         sr.addWidget(QLabel("Gaussian blur tile size:"))
         sr.addWidget(self.sigma_slider)
         sr.addWidget(self.sigma_value)
 
         self.fields_preview_btn = QPushButton("Calculate")
-        self._style_primary_action_button(self.fields_preview_btn)
+        self._style_large_action_button(self.fields_preview_btn)
+        self.fields_next_btn = QPushButton("Next")
+        self._style_primary_action_button(self.fields_next_btn)
+        self.fields_next_btn.setVisible(False)
 
         lay.addWidget(info)
         lay.addWidget(sigma_row)
         lay.addWidget(self.fields_preview_btn)
+        lay.addWidget(self.fields_next_btn)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, self.step_titles[2])
 
         self.sigma_slider.valueChanged.connect(self.on_sigma_changed)
         self.fields_preview_btn.clicked.connect(self.on_fields_preview)
+        self.fields_next_btn.clicked.connect(lambda: self._open_next_step(2))
 
     def _build_step4(self):
         page = QWidget()
@@ -930,8 +1055,12 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(rg_row)
         lay.addWidget(by_row)
         self.correction_preview_btn = QPushButton("Preview")
-        self._style_primary_action_button(self.correction_preview_btn)
+        self._style_large_action_button(self.correction_preview_btn)
+        self.correction_next_btn = QPushButton("Next")
+        self._style_primary_action_button(self.correction_next_btn)
+        self.correction_next_btn.setVisible(False)
         lay.addWidget(self.correction_preview_btn)
+        lay.addWidget(self.correction_next_btn)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, self.step_titles[3])
@@ -939,6 +1068,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.rg_strength_slider.valueChanged.connect(self.on_strength_changed)
         self.by_strength_slider.valueChanged.connect(self.on_strength_changed)
         self.correction_preview_btn.clicked.connect(self.on_correction_preview)
+        self.correction_next_btn.clicked.connect(lambda: self._open_next_step(3))
 
     def _build_step5(self):
         page = QWidget()
@@ -971,6 +1101,11 @@ class BlotchEqualizerWindow(QMainWindow):
     def status(self, text: str):
         self.statusBar().showMessage(text)
         LOG.info("STATUS | %s", text)
+
+    def _set_load_controls_enabled(self, enabled: bool):
+        self.load_btn.setEnabled(enabled)
+        self.input_browse_btn.setEnabled(enabled)
+        self.input_edit.setEnabled(enabled)
 
     def _register_thread(self, thread: QThread):
         self._active_threads.add(thread)
@@ -1025,30 +1160,54 @@ class BlotchEqualizerWindow(QMainWindow):
         self.correction_ready = False
 
     def load_input(self, path: Path):
+        if self.load_running:
+            self.status("Loading is already running...")
+            return
+
+        path = path.expanduser().resolve()
+        if not path.exists():
+            self.show_error(f"Input file not found: {path}")
+            return
+
+        self.load_thread = QThread(self)
+        self.load_thread.setObjectName("load_worker")
+        self._register_thread(self.load_thread)
+        self.load_worker = LoadWorker(str(path))
+        self.load_worker.moveToThread(self.load_thread)
+
+        self.load_thread.started.connect(self.load_worker.run)
+        self.load_worker.progress.connect(self.on_load_progress)
+        self.load_worker.finished.connect(self.on_load_finished)
+        self.load_worker.failed.connect(self.on_load_failed)
+        self.load_worker.finished.connect(self.cleanup_load_worker)
+        self.load_worker.failed.connect(self.cleanup_load_worker)
+
+        self.load_running = True
+        self._set_load_controls_enabled(False)
+        self.status(f"Loading image: {path}")
         LOG.info("Loading input file: %s", path)
-        try:
-            rgb_raw = imread(path)
-        except Exception as exc:
-            self.show_error(f"Failed to read TIFF: {exc}")
-            return
+        self.load_thread.start()
 
-        if rgb_raw.dtype != np.uint16:
-            self.show_error(f"Only 16-bit TIFF is supported right now. Got dtype={rgb_raw.dtype}")
-            return
+    @pyqtSlot(int, str)
+    def on_load_progress(self, percent: int, message: str):
+        self.status(f"Loading image... {percent}% | {message}")
 
-        try:
-            rgb_float = normalize_rgb(rgb_raw)
-            lab = color.rgb2lab(rgb_float).astype(np.float32)
-        except Exception as exc:
-            self.show_error(f"Failed to convert to Lab: {exc}")
-            return
+    @pyqtSlot(object)
+    def on_load_finished(self, result):
+        self.load_running = False
+        self._set_load_controls_enabled(True)
 
-        L = lab[..., 0]
-        a = lab[..., 1]
-        b = lab[..., 2]
-
-        base_background_mask, L_norm, base_stats = build_base_background_mask(L)
+        path = Path(result["path"])
+        rgb_raw = result["rgb_raw"]
+        rgb_float = result["rgb_float"]
+        lab = result["lab"]
+        L = result["L"]
+        a = result["a"]
+        b = result["b"]
+        L_norm = result["L_norm"]
+        base_stats = result["base_stats"]
         self.base_mask_stats = base_stats
+        base_background_mask = np.ones_like(L_norm, dtype=bool)
 
         self.pipeline = PipelineData(
             input_path=path,
@@ -1079,9 +1238,12 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_original_view()
         self.update_fields_view()
         self.update_corrected_view()
-        self.request_mask_recompute()
+        self.auto_open_step2_after_mask = True
+        self.status("Image displayed. Recomputing mask in background...")
+        QTimer.singleShot(0, self.request_mask_recompute)
 
         LOG.info("Loaded: %s", path)
+        LOG.info("Load elapsed: %.2fs", result["elapsed"])
         LOG.info("Raw shape=%s, dtype=%s", rgb_raw.shape, rgb_raw.dtype)
         LOG.info("L range: %.3f .. %.3f", float(np.min(L)), float(np.max(L)))
         LOG.info("a range: %.3f .. %.3f", float(np.min(a)), float(np.max(a)))
@@ -1102,9 +1264,32 @@ class BlotchEqualizerWindow(QMainWindow):
             base_stats["edge_thresh"],
         )
         LOG.info("background pixels: %.2f%%", base_stats["background_ratio_pct"])
+        LOG.info("Base mask precompute during load is skipped; step-2 mask is built asynchronously.")
 
         self.status(f"Loaded: {path.name} | shape={rgb_raw.shape} | dtype={rgb_raw.dtype}")
-        self._open_next_step(0)
+
+    @pyqtSlot(str)
+    def on_load_failed(self, message: str):
+        self.load_running = False
+        self.auto_open_step2_after_mask = False
+        self._set_load_controls_enabled(True)
+        LOG.error("Load failed: %s", message)
+        self.show_error(f"Load failed: {message}")
+
+    def cleanup_load_worker(self, *_):
+        worker = self.sender()
+        thread = worker.thread() if isinstance(worker, QObject) else self.load_thread
+        if not isinstance(thread, QThread):
+            thread = self.load_thread
+
+        self._stop_thread(thread)
+
+        if worker is self.load_worker:
+            self.load_worker = None
+        if thread is self.load_thread:
+            self.load_thread = None
+        if isinstance(worker, QObject):
+            worker.deleteLater()
 
     def on_browse_input(self):
         current = self.input_edit.text().strip() or str(Path.cwd())
@@ -1201,7 +1386,6 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def on_range_blur_changed(self, value: int):
         self.range_blur_value.setText(str(value))
-        self.on_mask_controls_changed()
 
     def on_mask_controls_changed(self, *_):
         if self.pipeline is None:
@@ -1216,10 +1400,11 @@ class BlotchEqualizerWindow(QMainWindow):
         self.request_mask_recompute()
 
     def on_sigma_changed(self, value: int):
-        self.sigma_value.setText(str(value))
+        sigma_lo = self.sigma_options[int(value)]
+        self.sigma_value.setText(str(sigma_lo))
         self.invalidate_fields()
         self._mark_steps_dirty_from(2)
-        LOG.info("Field sigma slider changed: sigma_lo=%d sigma_hi=%d", value, value * 2)
+        LOG.info("Field sigma slider changed: sigma_lo=%d sigma_hi=%d", sigma_lo, sigma_lo * 2)
         self.status("Gaussian tile size changed. RG/BY fields need new Preview.")
 
     def on_strength_changed(self):
@@ -1244,7 +1429,9 @@ class BlotchEqualizerWindow(QMainWindow):
         revision = self.mask_revision
 
         if self.mask_running:
-            self.status("Mask recalculation queued...")
+            if not self.mask_queue_notified:
+                self.status("Mask recalculation queued...")
+                self.mask_queue_notified = True
             return
 
         p = self.pipeline
@@ -1280,12 +1467,14 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_worker.failed.connect(self.cleanup_mask_worker)
 
         self.mask_running = True
+        self.mask_queue_notified = False
         self.status("Recomputing mask...")
         self.mask_thread.start()
 
     @pyqtSlot(object)
     def on_mask_finished(self, result):
         self.mask_running = False
+        self.mask_queue_notified = False
         if self.pipeline is None:
             return
 
@@ -1313,6 +1502,10 @@ class BlotchEqualizerWindow(QMainWindow):
         )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
 
+        if self.auto_open_step2_after_mask:
+            self.auto_open_step2_after_mask = False
+            self._open_next_step(0)
+
         if self.mask_apply_pending:
             self.mask_apply_pending = False
             self._set_step_dirty(1, False)
@@ -1328,6 +1521,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_running = False
         self.mask_ready = False
         self.mask_apply_pending = False
+        self.auto_open_step2_after_mask = False
+        self.mask_queue_notified = False
         self.show_error(f"Mask recomputation failed: {message}")
 
     def cleanup_mask_worker(self, *_):
@@ -1365,7 +1560,7 @@ class BlotchEqualizerWindow(QMainWindow):
             return
 
         rev = self.fields_revision
-        sigma_lo = int(self.sigma_slider.value())
+        sigma_lo = self.sigma_options[int(self.sigma_slider.value())]
         LOG.info(
             "Fields preview start | revision=%d | sigma_lo=%d sigma_hi=%d | mask=%.2f%%",
             rev,
@@ -1397,6 +1592,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.fields_running = True
         self.fields_preview_btn.setEnabled(False)
+        self.fields_next_btn.setVisible(False)
         self.status("Calculating RG/BY fields...")
         self.fields_thread.start()
 
@@ -1423,6 +1619,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.correction_revision += 1
         self.correction_ready = False
         self._set_step_dirty(2, False)
+        self.fields_next_btn.setVisible(True)
 
         LOG.info("RG axis sign convention: rg_sign=%+.0f", result["rg_sign"])
         LOG.info(
@@ -1456,12 +1653,12 @@ class BlotchEqualizerWindow(QMainWindow):
             f"coverage(alpha>0.5)={result['coverage']:.2f}%"
         )
         self.update_fields_view()
-        self._open_next_step(2)
 
     @pyqtSlot(str)
     def on_fields_failed(self, message: str):
         self.fields_running = False
         self.fields_preview_btn.setEnabled(True)
+        self.fields_next_btn.setVisible(False)
         LOG.error("Field calculation failed: %s", message)
         self.show_error(f"Field calculation failed: {message}")
 
@@ -1534,6 +1731,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.correction_running = True
         self.correction_preview_btn.setEnabled(False)
+        self.correction_next_btn.setVisible(False)
         self.status("Building corrected preview...")
         self.corr_thread.start()
 
@@ -1555,6 +1753,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.correction_preview_available = True
         self.correction_ready = True
         self._set_step_dirty(3, False)
+        self.correction_next_btn.setVisible(True)
         if self.toolbox.currentIndex() in (3, 4):
             self.update_corrected_view()
         LOG.info(
@@ -1566,12 +1765,12 @@ class BlotchEqualizerWindow(QMainWindow):
             result["by_k"],
         )
         self.status(f"Correction preview ready in {result['elapsed']:.2f}s")
-        self._open_next_step(3)
 
     @pyqtSlot(str)
     def on_correction_failed(self, message: str):
         self.correction_running = False
         self.correction_preview_btn.setEnabled(True)
+        self.correction_next_btn.setVisible(False)
         LOG.error("Correction preview failed: %s", message)
         self.show_error(f"Correction preview failed: {message}")
 
@@ -1701,7 +1900,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def closeEvent(self, event):
         all_threads = set(self._active_threads)
-        for thr in (self.mask_thread, self.fields_thread, self.corr_thread):
+        for thr in (self.load_thread, self.mask_thread, self.fields_thread, self.corr_thread):
             if thr is not None:
                 all_threads.add(thr)
 
@@ -1711,9 +1910,11 @@ class BlotchEqualizerWindow(QMainWindow):
                 LOG.info("Waiting for active thread to finish: %s", thr.objectName() or "worker")
             self._stop_thread(thr)
 
+        self.load_thread = None
         self.mask_thread = None
         self.fields_thread = None
         self.corr_thread = None
+        self.load_worker = None
         self.mask_worker = None
         self.fields_worker = None
         self.corr_worker = None
