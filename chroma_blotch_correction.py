@@ -700,6 +700,13 @@ class BlotchEqualizerWindow(QMainWindow):
         if changed:
             self._refresh_step_titles()
 
+    def _open_next_step(self, current_step_idx: int):
+        next_idx = current_step_idx + 1
+        if next_idx >= self.toolbox.count():
+            return
+        self.toolbox.setCurrentIndex(next_idx)
+        LOG.info("Auto-opened next step: %d -> %d", current_step_idx + 1, next_idx + 1)
+
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
@@ -881,7 +888,7 @@ class BlotchEqualizerWindow(QMainWindow):
         sr.addWidget(self.sigma_slider)
         sr.addWidget(self.sigma_value)
 
-        self.fields_preview_btn = QPushButton("Preview")
+        self.fields_preview_btn = QPushButton("Calculate")
         self._style_primary_action_button(self.fields_preview_btn)
 
         lay.addWidget(info)
@@ -1097,6 +1104,7 @@ class BlotchEqualizerWindow(QMainWindow):
         LOG.info("background pixels: %.2f%%", base_stats["background_ratio_pct"])
 
         self.status(f"Loaded: {path.name} | shape={rgb_raw.shape} | dtype={rgb_raw.dtype}")
+        self._open_next_step(0)
 
     def on_browse_input(self):
         current = self.input_edit.text().strip() or str(Path.cwd())
@@ -1189,6 +1197,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self._set_step_dirty(1, False)
         LOG.info("Apply mask completed.")
         self.status("Mask applied.")
+        self._open_next_step(1)
 
     def on_range_blur_changed(self, value: int):
         self.range_blur_value.setText(str(value))
@@ -1309,6 +1318,7 @@ class BlotchEqualizerWindow(QMainWindow):
             self._set_step_dirty(1, False)
             LOG.info("Apply mask completed after recalculation.")
             self.status("Mask applied.")
+            self._open_next_step(1)
 
         if self.mask_revision > result["revision"]:
             self.request_mask_recompute()
@@ -1446,6 +1456,7 @@ class BlotchEqualizerWindow(QMainWindow):
             f"coverage(alpha>0.5)={result['coverage']:.2f}%"
         )
         self.update_fields_view()
+        self._open_next_step(2)
 
     @pyqtSlot(str)
     def on_fields_failed(self, message: str):
@@ -1555,6 +1566,7 @@ class BlotchEqualizerWindow(QMainWindow):
             result["by_k"],
         )
         self.status(f"Correction preview ready in {result['elapsed']:.2f}s")
+        self._open_next_step(3)
 
     @pyqtSlot(str)
     def on_correction_failed(self, message: str):
