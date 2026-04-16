@@ -636,6 +636,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_worker: Optional[FieldsWorker] = None
         self.corr_thread: Optional[QThread] = None
         self.corr_worker: Optional[CorrectionWorker] = None
+        self._active_threads: set[QThread] = set()
 
         self._build_ui()
         self._init_paths(args.input, args.output)
@@ -872,6 +873,21 @@ class BlotchEqualizerWindow(QMainWindow):
         self.statusBar().showMessage(text)
         LOG.info("STATUS | %s", text)
 
+    def _register_thread(self, thread: QThread):
+        self._active_threads.add(thread)
+        thread.finished.connect(lambda thr=thread: self._active_threads.discard(thr))
+
+    def _stop_thread(self, thread: Optional[QThread]):
+        if thread is None:
+            return
+        self._active_threads.discard(thread)
+        if thread.isRunning():
+            LOG.info("Stopping thread: %s", thread.objectName() or "worker")
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait()
+        thread.deleteLater()
+
     def show_error(self, message: str):
         LOG.error(message)
         QMessageBox.critical(self, "Error", message)
@@ -1047,18 +1063,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self.range_blur_value.setText(str(value))
         self.on_mask_controls_changed()
 
-    def on_mask_threshold_changed(self, value: int):
-        self.mask_threshold_value.setText(f"{value / 100.0:.2f}")
-        self.on_mask_controls_changed()
-
     def on_mask_controls_changed(self, *_):
         if self.pipeline is None:
             return
         LOG.debug(
-            "Mask controls changed: invert=%s, blur=%s, threshold=%.2f",
+            "Mask controls changed: invert=%s, blur=%s",
             self.invert_check.isChecked(),
             self.range_blur_slider.value(),
-            self.mask_threshold_slider.value() / 100.0,
         )
         self.request_mask_recompute()
 
@@ -1096,18 +1107,17 @@ class BlotchEqualizerWindow(QMainWindow):
         xs, ys = self.curve.control_points()
         invert_output = self.invert_check.isChecked()
         blur_radius = float(self.range_blur_slider.value())
-        mask_threshold = float(self.mask_threshold_slider.value()) / 100.0
         LOG.info(
-            "Mask recompute request #%d | invert=%s | blur=%.2f | threshold=%.2f | curve_ys=%s",
+            "Mask recompute request #%d | invert=%s | blur=%.2f | curve_ys=%s",
             revision,
             invert_output,
             blur_radius,
-            mask_threshold,
             np.array2string(ys, precision=3),
         )
 
         self.mask_thread = QThread(self)
         self.mask_thread.setObjectName("mask_worker")
+        self._register_thread(self.mask_thread)
         self.mask_worker = MaskWorker(
             revision=revision,
             L_norm=p.L_norm.copy(),
@@ -1115,7 +1125,6 @@ class BlotchEqualizerWindow(QMainWindow):
             curve_ys=ys,
             invert_output=invert_output,
             blur_radius=blur_radius,
-            mask_threshold=mask_threshold,
         )
         self.mask_worker.moveToThread(self.mask_thread)
 
@@ -1125,7 +1134,6 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.mask_worker.finished.connect(self.cleanup_mask_worker)
         self.mask_worker.failed.connect(self.cleanup_mask_worker)
-        self.mask_thread.finished.connect(self.mask_thread.deleteLater)
 
         self.mask_running = True
         self.status("Recomputing mask...")
@@ -1160,8 +1168,6 @@ class BlotchEqualizerWindow(QMainWindow):
             result["working_mask_pct"],
         )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
-        if not np.any(self.pipeline.working_mask):
-            self.status("Mask updated, but working mask is empty. Lower threshold or change curve.")
 
         if self.mask_revision > result["revision"]:
             self.request_mask_recompute()
@@ -1173,11 +1179,19 @@ class BlotchEqualizerWindow(QMainWindow):
         self.show_error(f"Mask recomputation failed: {message}")
 
     def cleanup_mask_worker(self, *_):
-        if self.mask_thread is not None:
-            self.mask_thread.quit()
-            self.mask_thread.wait()
-        self.mask_worker = None
-        self.mask_thread = None
+        worker = self.sender()
+        thread = worker.thread() if isinstance(worker, QObject) else self.mask_thread
+        if not isinstance(thread, QThread):
+            thread = self.mask_thread
+
+        self._stop_thread(thread)
+
+        if worker is self.mask_worker:
+            self.mask_worker = None
+        if thread is self.mask_thread:
+            self.mask_thread = None
+        if isinstance(worker, QObject):
+            worker.deleteLater()
 
     def on_fields_preview(self):
         if self.pipeline is None:
@@ -1210,6 +1224,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.fields_thread = QThread(self)
         self.fields_thread.setObjectName("fields_worker")
+        self._register_thread(self.fields_thread)
         self.fields_worker = FieldsWorker(
             revision=rev,
             a=p.a,
@@ -1226,7 +1241,6 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.fields_worker.finished.connect(self.cleanup_fields_worker)
         self.fields_worker.failed.connect(self.cleanup_fields_worker)
-        self.fields_thread.finished.connect(self.fields_thread.deleteLater)
 
         self.fields_running = True
         self.fields_preview_btn.setEnabled(False)
@@ -1291,11 +1305,19 @@ class BlotchEqualizerWindow(QMainWindow):
         self.show_error(f"Field calculation failed: {message}")
 
     def cleanup_fields_worker(self, *_):
-        if self.fields_thread is not None:
-            self.fields_thread.quit()
-            self.fields_thread.wait()
-        self.fields_worker = None
-        self.fields_thread = None
+        worker = self.sender()
+        thread = worker.thread() if isinstance(worker, QObject) else self.fields_thread
+        if not isinstance(thread, QThread):
+            thread = self.fields_thread
+
+        self._stop_thread(thread)
+
+        if worker is self.fields_worker:
+            self.fields_worker = None
+        if thread is self.fields_thread:
+            self.fields_thread = None
+        if isinstance(worker, QObject):
+            worker.deleteLater()
 
     def on_correction_preview(self):
         if self.pipeline is None:
@@ -1326,6 +1348,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.corr_thread = QThread(self)
         self.corr_thread.setObjectName("correction_worker")
+        self._register_thread(self.corr_thread)
         self.corr_worker = CorrectionWorker(
             lab=p.lab.copy(),
             a=p.a.copy(),
@@ -1344,7 +1367,6 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.corr_worker.finished.connect(self.cleanup_correction_worker)
         self.corr_worker.failed.connect(self.cleanup_correction_worker)
-        self.corr_thread.finished.connect(self.corr_thread.deleteLater)
 
         self.correction_running = True
         self.correction_preview_btn.setEnabled(False)
@@ -1376,11 +1398,19 @@ class BlotchEqualizerWindow(QMainWindow):
         self.show_error(f"Correction preview failed: {message}")
 
     def cleanup_correction_worker(self, *_):
-        if self.corr_thread is not None:
-            self.corr_thread.quit()
-            self.corr_thread.wait()
-        self.corr_worker = None
-        self.corr_thread = None
+        worker = self.sender()
+        thread = worker.thread() if isinstance(worker, QObject) else self.corr_thread
+        if not isinstance(thread, QThread):
+            thread = self.corr_thread
+
+        self._stop_thread(thread)
+
+        if worker is self.corr_worker:
+            self.corr_worker = None
+        if thread is self.corr_thread:
+            self.corr_thread = None
+        if isinstance(worker, QObject):
+            worker.deleteLater()
 
     def save_tiff(self, rgb_corr: np.ndarray, output_path: Path) -> Path:
         output_path = output_path.expanduser().resolve()
@@ -1494,12 +1524,23 @@ class BlotchEqualizerWindow(QMainWindow):
         self.on_step_changed(idx)
 
     def closeEvent(self, event):
+        all_threads = set(self._active_threads)
         for thr in (self.mask_thread, self.fields_thread, self.corr_thread):
+            if thr is not None:
+                all_threads.add(thr)
+
+        for thr in all_threads:
             if thr is not None and thr.isRunning():
                 self.status("Waiting for background calculations to finish...")
                 LOG.info("Waiting for active thread to finish: %s", thr.objectName() or "worker")
-                thr.quit()
-                thr.wait()
+            self._stop_thread(thr)
+
+        self.mask_thread = None
+        self.fields_thread = None
+        self.corr_thread = None
+        self.mask_worker = None
+        self.fields_worker = None
+        self.corr_worker = None
         LOG.info("Application close")
         super().closeEvent(event)
 
@@ -1528,7 +1569,10 @@ def main(argv: list[str]) -> int:
     app = QApplication(sys.argv)
     win = BlotchEqualizerWindow(args)
     win.show()
-    return app.exec()
+    exit_code = app.exec()
+    qInstallMessageHandler(None)
+    LOG.info("Application exit with code %d", exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
