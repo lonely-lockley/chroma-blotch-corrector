@@ -28,6 +28,7 @@ except Exception:
     ASTROPY_AVAILABLE = False
 
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QtMsgType, pyqtSignal, pyqtSlot, qInstallMessageHandler
+from PyQt6 import sip
 from PyQt6.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -259,9 +260,108 @@ def _fits_require_astropy():
         )
 
 
+TIFF_DTYPE_TO_EXTRATAG = {
+    "BYTE": "B",
+    "UNDEFINED": "B",
+    "ASCII": "s",
+    "SHORT": "H",
+    "SSHORT": "h",
+    "LONG": "I",
+    "IFD": "I",
+    "SLONG": "i",
+    "LONG8": "Q",
+    "IFD8": "Q",
+    "SLONG8": "q",
+    "FLOAT": "f",
+    "DOUBLE": "d",
+    "RATIONAL": "2I",
+    "SRATIONAL": "2i",
+}
+
+# Writer-owned/structural tags that should not be copied as extratags.
+TIFF_TAG_SKIP_COPY = {
+    256, 257, 258, 259, 262,     # geometry / pixel format
+    273, 277, 278, 279,          # strip layout
+    282, 283, 284, 296,          # resolution/layout handled separately
+    317,                         # predictor handled via dedicated writer kwarg
+    322, 323, 324, 325,          # tile layout
+    338, 339,                    # extra samples / sample format
+    34665, 34853, 40965,         # EXIF/GPS/Interoperability IFD pointers
+}
+
+
+def _normalize_tiff_tag_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, tuple):
+        out = []
+        for v in value:
+            if hasattr(v, "value"):
+                out.append(int(v.value))
+            elif isinstance(v, np.generic):
+                out.append(v.item())
+            else:
+                out.append(v)
+        return tuple(out)
+    if hasattr(value, "value"):
+        return int(value.value)
+    return value
+
+
+def _extract_tiff_extratags(path: Path) -> tuple[list[tuple[int, str, int, Any, bool]], list[int]]:
+    extratags: list[tuple[int, str, int, Any, bool]] = []
+    skipped_codes: list[int] = []
+    with TiffFile(path) as tf:
+        page = tf.pages[0]
+        for code, tag in page.tags.items():
+            if code in TIFF_TAG_SKIP_COPY:
+                skipped_codes.append(int(code))
+                continue
+            if code in {270, 305, 306}:  # written via dedicated kwargs
+                continue
+            dtype_name = getattr(getattr(tag, "dtype", None), "name", None)
+            if dtype_name is None:
+                skipped_codes.append(int(code))
+                continue
+            etype = TIFF_DTYPE_TO_EXTRATAG.get(str(dtype_name))
+            if etype is None:
+                skipped_codes.append(int(code))
+                continue
+
+            value = _normalize_tiff_tag_value(tag.value)
+            if isinstance(value, dict):
+                skipped_codes.append(int(code))
+                continue
+            count = int(tag.count)
+            if etype == "s":
+                if not isinstance(value, str):
+                    skipped_codes.append(int(code))
+                    continue
+            elif etype == "B":
+                if isinstance(value, bytes):
+                    count = len(value)
+                elif isinstance(value, tuple):
+                    count = len(value)
+            elif etype in {"2I", "2i"}:
+                # Keep rational tags conservative: skip unsupported tuple shapes.
+                if isinstance(value, tuple) and len(value) == 2 and all(isinstance(v, (int, np.integer)) for v in value):
+                    count = 1
+                else:
+                    skipped_codes.append(int(code))
+                    continue
+
+            extratags.append((int(code), etype, count, value, True))
+    return extratags, skipped_codes
+
+
 def _extract_tiff_metadata(path: Path) -> dict[str, Any]:
     with TiffFile(path) as tf:
         page = tf.pages[0]
+        desc_tag = page.tags.get("ImageDescription")
         xres_tag = page.tags.get("XResolution")
         yres_tag = page.tags.get("YResolution")
         ru_tag = page.tags.get("ResolutionUnit")
@@ -280,7 +380,7 @@ def _extract_tiff_metadata(path: Path) -> dict[str, Any]:
         except Exception:
             compression = None
 
-        description = page.description if isinstance(page.description, str) and page.description else None
+        description = desc_tag.value if desc_tag is not None and isinstance(desc_tag.value, str) and desc_tag.value else None
         metadata = tf.imagej_metadata if getattr(tf, "is_imagej", False) else None
         photometric = "rgb"
         planarconfig = None
@@ -289,6 +389,11 @@ def _extract_tiff_metadata(path: Path) -> dict[str, Any]:
         except Exception:
             planarconfig = None
         software = page.tags.get("Software").value if page.tags.get("Software") is not None else None
+        datetime_value = page.tags.get("DateTime").value if page.tags.get("DateTime") is not None else None
+        exif_dict = page.tags.get("ExifTag").value if page.tags.get("ExifTag") is not None else None
+        predictor_value = page.tags.get("Predictor").value if page.tags.get("Predictor") is not None else None
+
+    extratags, skipped_codes = _extract_tiff_extratags(path)
 
     return {
         "tiff_description": description,
@@ -300,6 +405,11 @@ def _extract_tiff_metadata(path: Path) -> dict[str, Any]:
         "tiff_photometric": photometric,
         "tiff_planarconfig": planarconfig,
         "tiff_software": software,
+        "tiff_datetime": datetime_value,
+        "tiff_predictor": int(predictor_value.value) if hasattr(predictor_value, "value") else (int(predictor_value) if predictor_value is not None else None),
+        "tiff_exif_dict": exif_dict if isinstance(exif_dict, dict) else None,
+        "tiff_extratags": extratags,
+        "tiff_extratags_skipped": skipped_codes,
     }
 
 
@@ -352,6 +462,8 @@ def read_image_for_pipeline(path: Path) -> dict[str, Any]:
         if bitpix not in (8, 16, -32):
             raise RuntimeError(f"Unsupported FITS BITPIX={bitpix}. Expected 8, 16, or -32.")
         raw = np.asarray(image_hdu.data)
+        source_data_header = image_hdu.header.copy()
+        source_primary_header = hdul[0].header.copy() if len(hdul) > 0 else None
 
     input_dtype = np.dtype(raw.dtype)
     bit_code = "float32" if bitpix == -32 else ("uint8" if bitpix == 8 else "uint16")
@@ -366,6 +478,8 @@ def read_image_for_pipeline(path: Path) -> dict[str, Any]:
         "fits_bitpix": bitpix,
         "fits_original_shape": tuple(int(v) for v in raw.shape),
         "fits_channel_axis_first": bool(raw.ndim == 3 and raw.shape[0] in (3, 4) and raw.shape[-1] not in (3, 4)),
+        "fits_data_header": source_data_header,
+        "fits_primary_header": source_primary_header,
     }
     return {
         "path": str(path),
@@ -387,6 +501,27 @@ def encode_rgb_output(rgb_corr: np.ndarray, bit_depth_code: str) -> np.ndarray:
     if bit_depth_code == "uint8":
         return np.round(x * np.iinfo(np.uint8).max).astype(np.uint8)
     raise RuntimeError(f"Unsupported output bit depth: {bit_depth_code}")
+
+
+def _merge_fits_nonstructural_cards(dst_header, src_header):
+    if src_header is None:
+        return
+    structural = {"SIMPLE", "XTENSION", "BITPIX", "NAXIS", "EXTEND", "PCOUNT", "GCOUNT", "BZERO", "BSCALE", "CHECKSUM", "DATASUM"}
+    for card in src_header.cards:
+        key = card.keyword
+        if key == "" or key in structural or key.startswith("NAXIS"):
+            continue
+        if key in {"COMMENT", "HISTORY"}:
+            try:
+                dst_header.append(card, end=True)
+            except Exception:
+                pass
+            continue
+        try:
+            dst_header[key] = (card.value, card.comment)
+        except Exception:
+            # Skip unsupported card value types but keep writer alive.
+            continue
 
 
 def robust_center(x: np.ndarray, mask: np.ndarray) -> float:
@@ -487,9 +622,10 @@ def fit_array_to_shape(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 
 def rgb_to_qpixmap(rgb: np.ndarray, width: int, height: int) -> QPixmap:
-    rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+    rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8, copy=False)
+    rgb8 = np.ascontiguousarray(rgb8)
     h, w, _ = rgb8.shape
-    qimg = QImage(rgb8.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+    qimg = QImage(sip.voidptr(rgb8.ctypes.data), w, h, 3 * w, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg.copy()).scaled(
         max(32, width),
         max(32, height),
@@ -561,7 +697,7 @@ class CurveWidget(QWidget):
         super().__init__()
         self.setMinimumSize(260, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._xs = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+        self._xs = np.linspace(0.0, 1.0, 10, dtype=np.float32)
         self._ys = self._xs.copy()
         self._active_idx = -1
         self._drag_changed = False
@@ -2390,6 +2526,8 @@ class BlotchEqualizerWindow(QMainWindow):
         kwargs: dict[str, Any] = {
             "photometric": "rgb",
             "planarconfig": "CONTIG",
+            # Prevent tifffile from auto-writing JSON like {"shape":[...]} into ImageDescription.
+            "metadata": None,
         }
 
         if io_meta.get("source_format") == "tiff":
@@ -2397,19 +2535,41 @@ class BlotchEqualizerWindow(QMainWindow):
             resolutionunit = io_meta.get("tiff_resolutionunit")
             compression = io_meta.get("tiff_compression")
             software = io_meta.get("tiff_software")
+            datetime_value = io_meta.get("tiff_datetime")
+            predictor_value = io_meta.get("tiff_predictor")
+            extratags = io_meta.get("tiff_extratags")
+            skipped_codes = io_meta.get("tiff_extratags_skipped") or []
+            exif_dict = io_meta.get("tiff_exif_dict")
             if resolution is not None:
                 kwargs["resolution"] = resolution
             if resolutionunit is not None:
                 kwargs["resolutionunit"] = resolutionunit
             if compression and compression not in {"none", "uncompressed", "1"}:
                 kwargs["compression"] = compression
+            if predictor_value:
+                kwargs["predictor"] = int(predictor_value)
             if software:
                 kwargs["software"] = software
-            if io_meta.get("tiff_is_imagej") and io_meta.get("tiff_metadata"):
+            if datetime_value:
+                kwargs["datetime"] = datetime_value
+            if io_meta.get("tiff_description"):
+                # Keep original description text byte-for-byte semantics as much as possible.
+                kwargs["description"] = io_meta["tiff_description"]
+            elif io_meta.get("tiff_is_imagej") and io_meta.get("tiff_metadata"):
                 kwargs["imagej"] = True
                 kwargs["metadata"] = io_meta["tiff_metadata"]
-            elif io_meta.get("tiff_description"):
-                kwargs["description"] = io_meta["tiff_description"]
+            elif exif_dict:
+                # Fallback: keep EXIF dictionary visible in output metadata text.
+                kwargs["description"] = f"EXIF:{exif_dict}"
+            if extratags:
+                kwargs["extratags"] = extratags
+            LOG.info(
+                "TIFF metadata copy: extratags=%d skipped=%d",
+                len(extratags) if extratags else 0,
+                len(skipped_codes),
+            )
+            if skipped_codes:
+                LOG.debug("TIFF metadata skipped tag codes: %s", sorted(set(int(c) for c in skipped_codes)))
 
         imwrite(output_path, out, **kwargs)
         return output_path
@@ -2432,15 +2592,27 @@ class BlotchEqualizerWindow(QMainWindow):
 
         template_path = io_meta.get("fits_template_path")
         hdu_index = int(io_meta.get("fits_hdu_index", 0))
+        data_hdr = io_meta.get("fits_data_header")
+        primary_hdr = io_meta.get("fits_primary_header")
         if template_path and Path(template_path).exists():
             with astrofits.open(template_path, memmap=False) as hdul:  # type: ignore[union-attr]
                 if hdu_index >= len(hdul):
                     raise RuntimeError(f"Template FITS HDU index out of range: {hdu_index}")
                 hdul[hdu_index].data = out
+                _merge_fits_nonstructural_cards(hdul[hdu_index].header, data_hdr)
+                if hdu_index != 0 and len(hdul) > 0:
+                    _merge_fits_nonstructural_cards(hdul[0].header, primary_hdr)
                 hdul.writeto(output_path, overwrite=True)
         else:
-            hdu = astrofits.PrimaryHDU(out)  # type: ignore[union-attr]
-            astrofits.HDUList([hdu]).writeto(output_path, overwrite=True)  # type: ignore[union-attr]
+            if data_hdr is not None and hdu_index != 0:
+                prim = astrofits.PrimaryHDU(header=primary_hdr) if primary_hdr is not None else astrofits.PrimaryHDU()  # type: ignore[union-attr]
+                img = astrofits.ImageHDU(data=out, header=data_hdr)  # type: ignore[union-attr]
+                _merge_fits_nonstructural_cards(img.header, data_hdr)
+                astrofits.HDUList([prim, img]).writeto(output_path, overwrite=True)  # type: ignore[union-attr]
+            else:
+                hdu = astrofits.PrimaryHDU(out, header=data_hdr) if data_hdr is not None else astrofits.PrimaryHDU(out)  # type: ignore[union-attr]
+                _merge_fits_nonstructural_cards(hdu.header, data_hdr)
+                astrofits.HDUList([hdu]).writeto(output_path, overwrite=True)  # type: ignore[union-attr]
         return output_path
 
     def save_image(
