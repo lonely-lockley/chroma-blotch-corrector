@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chroma-blotch-corrector"
-version = "0.1.0"
+version = "1.0"
 description = "Standalone chroma blotch correction tool for astrophotography"
 readme = "README.md"
 requires-python = ">=3.10"
