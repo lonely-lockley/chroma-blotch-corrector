@@ -1,4 +1,4 @@
-# Chroma Blotch Corrector
+# Color Mottle Corrector
 
 `chroma-blotch-corrector` is a standalone desktop tool for reducing large-scale background color mottle in stretched OSC astrophotography images.
 
