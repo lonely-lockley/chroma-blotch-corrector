@@ -6,7 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "chroma-blotch-corrector"
 version = "0.1.0"
 description = "Standalone chroma blotch correction tool for astrophotography"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Alexey Zaytsev", email = "lonelylockley@gmail.com" },
+]
 dependencies = [
   "numpy",
   "scipy",
@@ -18,6 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 fits = ["astropy"]
+
+[project.urls]
+Homepage = "https://github.com/lonely-lockley/chroma-blotch-corrector"
+Repository = "https://github.com/lonely-lockley/chroma-blotch-corrector"
+Issues = "https://github.com/lonely-lockley/chroma-blotch-corrector/issues"
 
 [project.scripts]
 chroma-blotch-corrector = "chroma_blotch_correction:cli"
