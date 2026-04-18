@@ -18,11 +18,9 @@ dependencies = [
   "matplotlib",
   "tifffile",
   "scikit-image",
+  "astropy",
   "PyQt6",
 ]
-
-[project.optional-dependencies]
-fits = ["astropy"]
 
 [project.urls]
 Homepage = "https://github.com/lonely-lockley/chroma-blotch-corrector"

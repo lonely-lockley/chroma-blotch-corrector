@@ -6,4 +6,5 @@ scipy
 matplotlib
 tifffile
 scikit-image
+astropy
 PyQt6

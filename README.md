@@ -31,27 +31,6 @@ Install from PyPI:
 pip install chroma-blotch-corrector
 ```
 
-Install with explicit FITS support:
-
-```bash
-pip install "chroma-blotch-corrector[fits]"
-```
-
-## Run
-
-Launch the desktop application:
-
-```bash
-chroma-blotch-corrector
-```
-
-Optional CLI usage:
-
-```bash
-chroma-blotch-corrector --input /path/to/input.tiff --output /path/to/output_corrected.tiff
-chroma-blotch-corrector --siril --input /path/to/input.fits --output /path/to/output_corrected.fits
-```
-
 ## Workflow
 
 ### 1. Load Source Image
@@ -92,6 +71,9 @@ Then click **Calculate** to build the `RG_field` and `BY_field`.
 
 The preview will show the low-frequency correction fields used to neutralize background color imbalance.
 
+In most cases, the default value `32` works well and does not need adjustment.
+Tune this only if field geometry is detected incorrectly (for example, color fluctuation zones are too coarse or too fragmented).
+
 ### 4. Apply Correction
 
 Set the correction strengths:
@@ -118,8 +100,11 @@ Then click **Save**.
 ## Stretch Preview
 
 A global **Stretch image** checkbox is available in the image preview during the Source, Correction, and Save stages.
-
 Enable it to apply a visual stretch for easier inspection of subtle background color blotches.
+
+## Algorithm Development Notebook
+
+This repository also includes [`blotch_detection.ipynb`](blotch_detection.ipynb), used to prototype and validate the core correction algorithm step by step.
 
 ## Notes
 
