@@ -1,6 +1,6 @@
 # Chroma Blotch Corrector
 
-`chroma-blotch-corrector` is a standalone desktop tool for suppressing large-scale color blotches in low-signal background regions of stretched OSC astrophotography images.
+`chroma-blotch-corrector` is a standalone desktop tool for reducing large-scale background color mottle in stretched OSC astrophotography images.
 
 It is intended for cases where residual red/green and blue/yellow background imbalance remains visible after the normal processing pipeline, such as stacking, calibration, gradient removal, and color calibration.
 
@@ -12,7 +12,7 @@ This tool is designed for stretched, pre-final images.
 
 Use it as a last-resort correction step when your normal astrophotography workflow can no longer clean the background adequately.
 
-It is optimized for large-scale, low-frequency color artifacts in the background. It is not intended to fix high-frequency chroma noise or replace proper calibration and background extraction earlier in the pipeline.
+It is optimized for large-scale, low-frequency background color mottle. It is not intended to fix high-frequency chroma noise or replace proper calibration and background extraction earlier in the pipeline.
 
 ![](assets/comparison_m45.jpg)
 
@@ -80,7 +80,7 @@ Then click **Calculate** to build the `RG_field` and `BY_field`.
 The preview will show the low-frequency correction fields used to neutralize background color imbalance.
 
 In most cases, the default value `32` works well and does not need adjustment.
-Tune this only if field geometry is detected incorrectly (for example, color fluctuation zones are too coarse or too fragmented).
+Tune this only if field geometry is detected incorrectly, for example when color mottle structures are captured too coarsely or too fragmentedly.
 
 ### 4. Apply Correction
 
@@ -108,7 +108,7 @@ Then click **Save**.
 ## Stretch Preview
 
 A global **Stretch image** checkbox is available in the image preview during the Source, Correction, and Save stages.
-Enable it to apply a visual stretch for easier inspection of subtle background color blotches.
+Enable it to apply a visual stretch for easier inspection of subtle background color mottle.
 
 ## Algorithm Development Notebook
 
@@ -116,8 +116,8 @@ This repository also includes [`blotch_detection.ipynb`](blotch_detection.ipynb)
 
 ## Notes
 
-- This tool is intended for large, low-frequency background chroma artifacts rather than random small-scale color noise.
-- It works best on already stretched images where the blotches are clearly visible.
+- This tool is intended for large, low-frequency background color mottle rather than random small-scale color noise.
+- It works best on already stretched images where the mottle is clearly visible.
 - It should be used conservatively and only when standard processing steps are no longer sufficient.
 
 ## Author
