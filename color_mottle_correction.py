@@ -658,6 +658,33 @@ def overlay_correction_alpha(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     return out.astype(np.float32, copy=False)
 
 
+def overlay_field_contours_on_source(
+    base_rgb: np.ndarray,
+    field_rgb: np.ndarray,
+    apply_alpha: np.ndarray,
+    edge_percentile: float = 70.0,
+    contour_opacity: float = 0.95,
+) -> np.ndarray:
+    base = clamp01(base_rgb.astype(np.float32, copy=False))
+    field = clamp01(field_rgb.astype(np.float32, copy=False))
+
+    # Build bright contour lines from field gradients.
+    lum = (0.2126 * field[..., 0] + 0.7152 * field[..., 1] + 0.0722 * field[..., 2]).astype(np.float32)
+    grad = filters.sobel(lum).astype(np.float32)
+    thr = float(np.percentile(grad, edge_percentile))
+    spread = max(thr * 0.7, 1e-6)
+    edge = clamp01((grad - thr) / spread)
+    edge = ndi.gaussian_filter(edge, sigma=0.8, mode="nearest").astype(np.float32)
+
+    # Keep contours where correction is actually applied.
+    alpha_mask = np.power(clamp01(apply_alpha.astype(np.float32, copy=False)), 0.75)
+    a = clamp01(edge * alpha_mask * float(np.clip(contour_opacity, 0.0, 1.0)))
+
+    contour_color = clamp01(field * 1.15 + 0.02)
+    out = base * (1.0 - a[..., None]) + contour_color * a[..., None]
+    return out.astype(np.float32, copy=False)
+
+
 def stretch_rgb_preview(rgb: np.ndarray) -> np.ndarray:
     x = clamp01(rgb.astype(np.float32, copy=False))
     if x.size == 0:
@@ -1453,6 +1480,13 @@ class BlotchEqualizerWindow(QMainWindow):
         row.addWidget(self.by_view)
         fbox.addLayout(row)
 
+        row_overlay = QHBoxLayout()
+        self.rg_overlay_view = self._make_image_label("RG overlay on source")
+        self.by_overlay_view = self._make_image_label("BY overlay on source")
+        row_overlay.addWidget(self.rg_overlay_view)
+        row_overlay.addWidget(self.by_overlay_view)
+        fbox.addLayout(row_overlay)
+
         self.right_layout.addWidget(self.original_view)
         self.right_layout.addWidget(self.mask_view)
         self.right_layout.addWidget(self.fields_container)
@@ -1823,6 +1857,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_view.set_placeholder("Load source first.")
         self.rg_view.set_placeholder("Load source first.")
         self.by_view.set_placeholder("Load source first.")
+        self.rg_overlay_view.set_placeholder("Load source first.")
+        self.by_overlay_view.set_placeholder("Load source first.")
         self.corrected_view.set_placeholder("Load source first.")
         if self.siril_mode:
             self.status("Siril mode: source preselected. Loading image...")
@@ -2646,7 +2682,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def on_step_changed(self, idx: int):
         LOG.debug("Step changed: %d", idx + 1)
-        self.preview_controls.setVisible(idx in (0, 3, 4))
+        self.preview_controls.setVisible(idx in (0, 2, 3, 4))
         self.original_view.setVisible(False)
         self.mask_view.setVisible(False)
         self.fields_container.setVisible(False)
@@ -2686,11 +2722,15 @@ class BlotchEqualizerWindow(QMainWindow):
         if self.pipeline is None:
             self.rg_view.set_placeholder("RG field")
             self.by_view.set_placeholder("BY field")
+            self.rg_overlay_view.set_placeholder("RG overlay on source")
+            self.by_overlay_view.set_placeholder("BY overlay on source")
             return
 
         if not self.fields_preview_available:
             self.rg_view.set_placeholder("RG preview not available")
             self.by_view.set_placeholder("BY preview not available")
+            self.rg_overlay_view.set_placeholder("RG overlay not available")
+            self.by_overlay_view.set_placeholder("BY overlay not available")
             return
 
         full_mask = np.ones(self.pipeline.RG_field.shape, dtype=bool)
@@ -2698,9 +2738,14 @@ class BlotchEqualizerWindow(QMainWindow):
         by_rgb = heatmap_rgb(self.pipeline.BY_field, full_mask, "coolwarm")
         rg_rgb = overlay_correction_alpha(rg_rgb, self.pipeline.apply_alpha)
         by_rgb = overlay_correction_alpha(by_rgb, self.pipeline.apply_alpha)
+        src_rgb = self._display_rgb(self.pipeline.rgb_float, allow_stretch=True)
+        rg_overlay = overlay_field_contours_on_source(src_rgb, rg_rgb, self.pipeline.apply_alpha)
+        by_overlay = overlay_field_contours_on_source(src_rgb, by_rgb, self.pipeline.apply_alpha)
 
         self.rg_view.set_image(rg_rgb)
         self.by_view.set_image(by_rgb)
+        self.rg_overlay_view.set_image(rg_overlay)
+        self.by_overlay_view.set_image(by_overlay)
 
     def update_corrected_view(self):
         if self.pipeline is None:
