@@ -1195,7 +1195,6 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_apply_pending = False
         self.mask_apply_auto = False
         self.mask_queue_notified = False
-        self.auto_open_step2_after_mask = False
         self.mask_prepared_L_work: Optional[np.ndarray] = None
         self.mask_prepared_scale: float = 1.0
         self.mask_prepared_src_shape: Optional[tuple[int, int]] = None
@@ -1477,7 +1476,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit = QLineEdit()
         self.input_browse_btn = QPushButton("Browse")
         self.load_btn = QPushButton("Load")
-        self.continue_btn = QPushButton("Continue")
+        self.continue_btn = QPushButton("Next")
 
         row = QWidget()
         r = QHBoxLayout(row)
@@ -1858,6 +1857,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.load_worker.failed.connect(self.cleanup_load_worker)
 
         self.load_running = True
+        if not self.siril_mode:
+            self.continue_btn.setVisible(False)
         self._set_load_controls_enabled(False)
         self.status(f"Loading image: {path}")
         LOG.info("Loading input file: %s", path)
@@ -1922,7 +1923,6 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_fields_view()
         self.update_corrected_view()
         self._set_save_defaults_from_loaded(input_format, input_bit_depth)
-        self.auto_open_step2_after_mask = (self.auto_target_step == 0) and (not self.siril_mode)
         self.status("Image displayed. Recomputing mask in background...")
         QTimer.singleShot(0, self.request_mask_recompute)
 
@@ -1959,7 +1959,8 @@ class BlotchEqualizerWindow(QMainWindow):
     @pyqtSlot(str)
     def on_load_failed(self, message: str):
         self.load_running = False
-        self.auto_open_step2_after_mask = False
+        if not self.siril_mode:
+            self.continue_btn.setVisible(False)
         self._set_load_controls_enabled(True)
         self._clear_auto_target()
         LOG.error("Load failed: %s", message)
@@ -2012,6 +2013,8 @@ class BlotchEqualizerWindow(QMainWindow):
             pass
         self._set_step_dirty(0, True)
         self._mark_steps_dirty_from(1)
+        if not self.siril_mode:
+            self.continue_btn.setVisible(False)
         LOG.info("Input path set: %s", path)
         LOG.info("Output path auto-set: %s", self.output_edit.text().strip())
         self.status("Input path updated. Press Load.")
@@ -2219,9 +2222,8 @@ class BlotchEqualizerWindow(QMainWindow):
         )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
 
-        if self.auto_open_step2_after_mask:
-            self.auto_open_step2_after_mask = False
-            self._open_next_step(0)
+        if not self.siril_mode:
+            self.continue_btn.setVisible(True)
 
         if self.mask_apply_pending:
             self._complete_mask_apply(auto=self.mask_apply_auto)
@@ -2238,7 +2240,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_ready = False
         self.mask_apply_pending = False
         self.mask_apply_auto = False
-        self.auto_open_step2_after_mask = False
+        if not self.siril_mode:
+            self.continue_btn.setVisible(False)
         self.mask_queue_notified = False
         self._clear_auto_target()
         self.show_error(f"Mask recomputation failed: {message}")
