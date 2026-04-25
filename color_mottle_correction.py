@@ -821,24 +821,39 @@ class FitImageLabel(QLabel):
         super().__init__(placeholder)
         self.placeholder = placeholder
         self._image: Optional[np.ndarray] = None
+        self._pixmap_cache: Optional[QPixmap] = None
+        self._pixmap_cache_key: Optional[tuple[int, int, int]] = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("QLabel { background: #1f1f1f; border: 1px solid #3a3a3a; color: #cfcfcf; }")
         self.setMinimumSize(200, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_image(self, rgb: np.ndarray):
-        self._image = rgb.astype(np.float32)
+        img = rgb.astype(np.float32, copy=False)
+        if self._image is not img:
+            self._pixmap_cache = None
+            self._pixmap_cache_key = None
+        self._image = img
         self._refresh()
 
     def set_placeholder(self, text: Optional[str] = None):
         self._image = None
+        self._pixmap_cache = None
+        self._pixmap_cache_key = None
         self.setPixmap(QPixmap())
         self.setText(text if text is not None else self.placeholder)
 
     def _refresh(self):
         if self._image is None:
             return
+        key = (id(self._image), self.width(), self.height())
+        if self._pixmap_cache is not None and self._pixmap_cache_key == key:
+            self.setPixmap(self._pixmap_cache)
+            self.setText("")
+            return
         pix = rgb_to_qpixmap(self._image, self.width(), self.height())
+        self._pixmap_cache = pix
+        self._pixmap_cache_key = key
         self.setPixmap(pix)
         self.setText("")
 
@@ -1257,6 +1272,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.corr_thread: Optional[QThread] = None
         self.corr_worker: Optional[CorrectionWorker] = None
         self._active_threads: set[QThread] = set()
+        self._preview_cache: dict[str, Any] = {}
 
         self._build_ui()
         self._init_paths(args.input, args.output)
@@ -1778,6 +1794,14 @@ class BlotchEqualizerWindow(QMainWindow):
         self._populate_bitdepth_combo(input_format, preferred_code=input_bit_depth)
         self._sync_output_extension_to_format(mark_dirty=False)
 
+    def _clear_preview_cache(self, prefixes: Optional[tuple[str, ...]] = None):
+        if prefixes is None:
+            self._preview_cache.clear()
+            return
+        keys = [k for k in self._preview_cache.keys() if any(k.startswith(p) for p in prefixes)]
+        for k in keys:
+            self._preview_cache.pop(k, None)
+
     def on_save_format_changed(self):
         fmt = self._selected_save_format()
         self._populate_bitdepth_combo(fmt)
@@ -1874,6 +1898,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_ready = False
         self.correction_revision += 1
         self.correction_ready = False
+        self._clear_preview_cache(("fields:", "corrected:"))
 
     def load_input(self, path: Path):
         if self.load_running:
@@ -1952,6 +1977,7 @@ class BlotchEqualizerWindow(QMainWindow):
             BY_field=np.zeros_like(L_norm, dtype=np.float32),
             apply_alpha=np.zeros_like(L_norm, dtype=np.float32),
         )
+        self._clear_preview_cache()
 
         self.mask_ready = False
         self.mask_prepared_L_work = None
@@ -2235,6 +2261,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.range_soft = result["range_soft"]
         self.mask_ready = True
         self.invalidate_fields()
+        self._clear_preview_cache(("mask",))
 
         if result.get("cache_generated") and isinstance(result.get("prepared_L_work"), np.ndarray):
             self.mask_prepared_L_work = result["prepared_L_work"]
@@ -2369,6 +2396,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.RG_field = result["RG_field"]
         self.pipeline.BY_field = result["BY_field"]
         self.pipeline.apply_alpha = result["apply_alpha"]
+        self._clear_preview_cache(("fields:", "corrected:"))
         self.fields_ready = True
         self.fields_preview_available = True
         self.correction_revision += 1
@@ -2497,6 +2525,7 @@ class BlotchEqualizerWindow(QMainWindow):
             return
 
         self.current_corrected_rgb = result["rgb_corr"]
+        self._clear_preview_cache(("corrected:",))
         self.correction_preview_available = True
         self.correction_ready = True
         self._set_step_dirty(3, False)
@@ -2705,17 +2734,26 @@ class BlotchEqualizerWindow(QMainWindow):
         if self.pipeline is None:
             self.original_view.set_placeholder("Source image")
             return
-        self.original_view.set_image(self._display_rgb(self.pipeline.rgb_float, allow_stretch=True))
+        key = f"source:{int(self.stretch_preview_enabled)}"
+        rgb = self._preview_cache.get(key)
+        if not isinstance(rgb, np.ndarray):
+            rgb = self._display_rgb(self.pipeline.rgb_float, allow_stretch=True).astype(np.float32, copy=False)
+            self._preview_cache[key] = rgb
+        self.original_view.set_image(rgb)
 
     def update_mask_view(self):
         if self.pipeline is None:
             self.mask_view.set_placeholder("Mask preview")
             return
 
-        # Keep preview semantics aligned with field overlays:
-        # dark = protected (low correction), bright = stronger correction.
-        gray = clamp01(1.0 - self.pipeline.range_soft).astype(np.float32)
-        mask_rgb = np.repeat(gray[..., None], 3, axis=2)
+        key = "mask"
+        mask_rgb = self._preview_cache.get(key)
+        if not isinstance(mask_rgb, np.ndarray):
+            # Keep preview semantics aligned with field overlays:
+            # dark = protected (low correction), bright = stronger correction.
+            gray = clamp01(1.0 - self.pipeline.range_soft).astype(np.float32)
+            mask_rgb = np.repeat(gray[..., None], 3, axis=2).astype(np.float32, copy=False)
+            self._preview_cache[key] = mask_rgb
         self.mask_view.set_image(mask_rgb)
 
     def update_fields_view(self):
@@ -2733,14 +2771,20 @@ class BlotchEqualizerWindow(QMainWindow):
             self.by_overlay_view.set_placeholder("BY overlay not available")
             return
 
-        full_mask = np.ones(self.pipeline.RG_field.shape, dtype=bool)
-        rg_rgb = heatmap_rgb(self.pipeline.RG_field, full_mask, "RdYlGn_r")
-        by_rgb = heatmap_rgb(self.pipeline.BY_field, full_mask, "coolwarm")
-        rg_rgb = overlay_correction_alpha(rg_rgb, self.pipeline.apply_alpha)
-        by_rgb = overlay_correction_alpha(by_rgb, self.pipeline.apply_alpha)
-        src_rgb = self._display_rgb(self.pipeline.rgb_float, allow_stretch=True)
-        rg_overlay = overlay_field_contours_on_source(src_rgb, rg_rgb, self.pipeline.apply_alpha)
-        by_overlay = overlay_field_contours_on_source(src_rgb, by_rgb, self.pipeline.apply_alpha)
+        key = f"fields:{int(self.stretch_preview_enabled)}"
+        cached = self._preview_cache.get(key)
+        if isinstance(cached, tuple) and len(cached) == 4:
+            rg_rgb, by_rgb, rg_overlay, by_overlay = cached
+        else:
+            full_mask = np.ones(self.pipeline.RG_field.shape, dtype=bool)
+            rg_rgb = heatmap_rgb(self.pipeline.RG_field, full_mask, "RdYlGn_r")
+            by_rgb = heatmap_rgb(self.pipeline.BY_field, full_mask, "coolwarm")
+            rg_rgb = overlay_correction_alpha(rg_rgb, self.pipeline.apply_alpha)
+            by_rgb = overlay_correction_alpha(by_rgb, self.pipeline.apply_alpha)
+            src_rgb = self._display_rgb(self.pipeline.rgb_float, allow_stretch=True)
+            rg_overlay = overlay_field_contours_on_source(src_rgb, rg_rgb, self.pipeline.apply_alpha)
+            by_overlay = overlay_field_contours_on_source(src_rgb, by_rgb, self.pipeline.apply_alpha)
+            self._preview_cache[key] = (rg_rgb, by_rgb, rg_overlay, by_overlay)
 
         self.rg_view.set_image(rg_rgb)
         self.by_view.set_image(by_rgb)
@@ -2755,7 +2799,12 @@ class BlotchEqualizerWindow(QMainWindow):
         if not self.correction_preview_available or self.current_corrected_rgb is None:
             self.corrected_view.set_placeholder("Preview not available")
             return
-        self.corrected_view.set_image(self._display_rgb(self.current_corrected_rgb, allow_stretch=True))
+        key = f"corrected:{int(self.stretch_preview_enabled)}"
+        rgb = self._preview_cache.get(key)
+        if not isinstance(rgb, np.ndarray):
+            rgb = self._display_rgb(self.current_corrected_rgb, allow_stretch=True).astype(np.float32, copy=False)
+            self._preview_cache[key] = rgb
+        self.corrected_view.set_image(rgb)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

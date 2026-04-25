@@ -148,12 +148,6 @@ Enable it to apply a visual stretch for easier inspection of subtle background c
 
 This repository also includes [`blotch_detection.ipynb`](blotch_detection.ipynb), used to prototype and validate the core correction algorithm step by step.
 
-## Notes
-
-- This tool is intended for large, low-frequency background color mottle rather than random small-scale color noise.
-- It works best on already stretched images where the mottle is clearly visible.
-- It should be used conservatively and only when standard processing steps are no longer sufficient.
-
 ## Author
 
 Alexey Zaytsev  
