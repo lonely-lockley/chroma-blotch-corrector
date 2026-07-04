@@ -17,6 +17,10 @@ import numpy as np
 if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = str(Path(tempfile.gettempdir()) / "mplconfig")
 from matplotlib import cm
+try:
+    from matplotlib import colormaps as mpl_colormaps
+except Exception:
+    mpl_colormaps = None
 from scipy import ndimage as ndi
 from skimage import color, filters, morphology
 from tifffile import TiffFile, imwrite
@@ -642,7 +646,8 @@ def heatmap_rgb(data: np.ndarray, mask: np.ndarray, cmap_name: str) -> np.ndarra
         lim = 1.0
 
     norm = clamp01((data / lim) * 0.5 + 0.5)
-    rgba = cm.get_cmap(cmap_name)(norm)
+    cmap = mpl_colormaps[cmap_name] if mpl_colormaps is not None else cm.get_cmap(cmap_name)
+    rgba = cmap(norm)
     rgb = rgba[..., :3]
 
     bg = np.ones_like(rgb) * 0.08
@@ -2435,7 +2440,13 @@ class BlotchEqualizerWindow(QMainWindow):
             f"sigma={result['sigma_lo']}/{result['sigma_hi']} | "
             f"coverage(alpha>0.5)={result['coverage']:.2f}%"
         )
-        self.update_fields_view()
+        try:
+            self.update_fields_view()
+        except Exception as exc:
+            LOG.exception("Field preview rendering failed")
+            self._clear_auto_target()
+            self.show_error(f"Field preview rendering failed: {exc}")
+            return
         self._drive_auto_pipeline()
 
     @pyqtSlot(str)
@@ -2531,7 +2542,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self._set_step_dirty(3, False)
         self.correction_next_btn.setVisible(True)
         if self.toolbox.currentIndex() in (3, 4):
-            self.update_corrected_view()
+            try:
+                self.update_corrected_view()
+            except Exception as exc:
+                LOG.exception("Correction preview rendering failed")
+                self._clear_auto_target()
+                self.show_error(f"Correction preview rendering failed: {exc}")
+                return
         LOG.info(
             "Correction preview done | elapsed=%.2fs | delta_rg_sigma=%.4f | delta_by_sigma=%.4f | RG=%.2f | BY=%.2f",
             result["elapsed"],
